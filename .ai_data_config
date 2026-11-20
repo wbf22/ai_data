@@ -1,0 +1,10 @@
+# .ai_data_config - what to include in src.zip (gitignore-style globs)
+# One pattern per line. Blank lines and lines starting with '#' are ignored.
+# A pattern with no slash matches at any depth; leading '!' excludes.
+
+*
+
+# never ship the captured output or installed plugin deps back into the archive
+!data/
+!.opencode/node_modules/
+!__pycache__/
