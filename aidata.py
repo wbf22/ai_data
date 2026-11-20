@@ -41,20 +41,28 @@ ZIP_NAME = "src.zip"
 # where the .opencode/plugin/aidata-capture.ts plugin drops system prompt + tool defs
 CAPTURE_DIR = Path(os.environ.get("AIDATA_CAPTURE_DIR", Path.home() / ".local" / "share" / "opencode" / "aidata-capture"))
 
-PROBLEM_ITEMS = [
-    ("broken_code", "broken code (if 'no' implies code runs without problems or was otherwise acceptable)"),
-    ("skipped_prompt", "skipped part of prompt"),
-    ("went_beyond", "went beyond prompt"),
+OUTCOME_CHOICES = [
+    ("success", "succeeded - task fully accomplished"),
+    ("partial", "partial - some of the task done, some not"),
+    ("fail", "failed - task not accomplished"),
+]
+
+ISSUE_ITEMS = [
+    ("broken_code", "broken code (does not run or is otherwise broken)"),
+    ("scope_deviation", "scope deviation (skipped part of, or went beyond, the prompt)"),
+    ("wrong_reasoning", "wrong reasoning / abandoned a correct approach"),
+    ("tool_misuse", "tool misuse (bad command, wrong file, ignored tool output)"),
+    ("context_loss", "context loss (forgot an earlier requirement or decision)"),
+    ("hallucinated_api", "hallucinated API, symbol, or file"),
+    ("broke_existing", "broke something that worked before"),
+    ("gave_up", "gave up / stopped early"),
     ("bad_code_style", "bad code or code style that works"),
     ("dishonest_final", "dishonest final message"),
-    ("final_too_long", "final message too long"),
-    ("final_too_short", "final message too short"),
     ("other", "other"),
 ]
 
 EXCEPTIONAL_ITEMS = [
     ("clever_solution", "clever solution"),
-    ("first_try", "first try"),
     ("exceptionally_well_integrated", "exceptionally well integrated in existing code"),
     ("other", "other"),
 ]
@@ -78,6 +86,20 @@ def run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
 def die(msg: str) -> None:
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def unique_dir(parent: Path, stem: str) -> Path:
+    """Return a fresh `<parent>/<stem>` path, appending -2, -3, ... on collision.
+
+    Each `end` run gets its own folder so one opencode session can yield several
+    training examples.
+    """
+    candidate = parent / stem
+    suffix = 2
+    while candidate.exists():
+        candidate = parent / f"{stem}-{suffix}"
+        suffix += 1
+    return candidate
 
 
 # --------------------------------------------------------------------------- #
@@ -525,16 +547,6 @@ def render_markdown(data: dict) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def ask_yes_no(question: str) -> bool:
-    while True:
-        answer = input(f"{question} [y/n]: ").strip().lower()
-        if answer in ("y", "yes"):
-            return True
-        if answer in ("n", "no"):
-            return False
-        print("  please answer y or n")
-
-
 def ask_multiselect(items: list[tuple[str, str]]) -> list[str]:
     for i, (_, label) in enumerate(items, 1):
         print(f"  {i}. {label}")
@@ -562,24 +574,52 @@ def ask_text(prompt: str) -> str:
         print("  a description is required")
 
 
-def collect_section(title: str, question: str, items: list[tuple[str, str]]) -> dict:
-    print(f"\n== {title} ==")
-    flagged = ask_yes_no(question)
-    selected: list[str] = []
-    descriptions: dict[str, str] = {}
-    if flagged:
-        selected = ask_multiselect(items)
-        for key, label in items:
-            if key in selected:
-                descriptions[key] = ask_text(f"  describe: {label}")
+def ask_choice(question: str, items: list[tuple[str, str]]) -> tuple[str, str]:
+    print(question)
+    for i, (_, label) in enumerate(items, 1):
+        print(f"  {i}. {label}")
+    while True:
+        raw = input(f"  select [1-{len(items)}]: ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(items):
+            return items[int(raw) - 1]
+        print("  invalid input")
 
-    section: dict = {"flagged": flagged, "items": {}}
+
+def collect_outcome() -> dict:
+    print("\n== Outcome ==")
+    key, label = ask_choice("What was the outcome?", OUTCOME_CHOICES)
+    print()
+    evidence = ask_text("  provide proof (e.g. file, command, test name, tool call)")
+    return {"value": key, "label": label, "evidence": evidence}
+
+
+def collect_items(title: str, items: list[tuple[str, str]]) -> dict:
+    print(f"\n== {title} ==")
+    print("  select every option that applies (blank = none)")
+    selected = ask_multiselect(items)
+    descriptions: dict[str, str] = {}
     for key, label in items:
-        if flagged and key in selected:
+        if key in selected:
+            descriptions[key] = ask_text(f"  describe: {label}")
+    section: dict = {"flagged": bool(selected), "items": {}}
+    for key, label in items:
+        if key in selected:
             section["items"][key] = {"label": label, "marked": "yes", "description": descriptions[key]}
         else:
             section["items"][key] = {"label": label, "marked": "no", "description": None}
     return section
+
+
+def render_items_section(lines: list[str], heading: str, section: dict) -> None:
+    lines.append(f"## {heading} - {'YES' if section['flagged'] else 'NO'}")
+    lines.append("")
+    for item in section["items"].values():
+        mark = item["marked"].upper()
+        entry = f"- [{mark}] {item['label']}"
+        if item.get("description"):
+            entry += f" - {item['description']}"
+        lines.append(entry)
+    lines.append("")
 
 
 def render_rubric_markdown(rubric: dict) -> str:
@@ -590,23 +630,16 @@ def render_rubric_markdown(rubric: dict) -> str:
     lines.append(f"- **Labeled at:** {rubric['labeled_at']}")
     lines.append("")
 
-    for section_key, heading in (("problems", "Any problems?"), ("exceptional", "Anything done exceptionally well?")):
-        section = labels[section_key]
-        verdict = "YES" if section["flagged"] else "NO"
-        lines.append(f"## {heading} - {verdict}")
-        lines.append("")
-        for item in section["items"].values():
-            mark = item["marked"].upper()
-            entry = f"- [{mark}] {item['label']}"
-            if item.get("description"):
-                entry += f" - {item['description']}"
-            lines.append(entry)
-        lines.append("")
+    outcome = labels["outcome"]
+    lines.append(f"## Outcome - {outcome['label']}")
+    lines.append("")
+    evidence = outcome.get("evidence")
+    if evidence:
+        lines.append(f"- **Evidence:** {evidence}")
+    lines.append("")
 
-    lines.append("## Overall description")
-    lines.append("")
-    lines.append(labels["overall_description"])
-    lines.append("")
+    render_items_section(lines, "Issues", labels["issues"])
+    render_items_section(lines, "Anything done exceptionally well?", labels["exceptional"])
     return "\n".join(lines)
 
 
@@ -662,9 +695,10 @@ def cmd_end(args: argparse.Namespace) -> None:
     print(f"exporting session {session_id} ...")
     data = export_session(repo, session_id)
 
-    stem = f"session-{session_id[:8]}"
+    stem = unique_dir(DATA_ROOT, f"session-{session_id[:8]}").name
     outdir = DATA_ROOT / stem
-    outdir.mkdir(parents=True, exist_ok=True)
+    outdir.mkdir(parents=True)
+    print(f"capturing into data/{stem}/")
 
     sanitize_report: dict = {
         "session_id": session_id,
@@ -752,13 +786,13 @@ def cmd_end(args: argparse.Namespace) -> None:
             break
 
     labels = {
-        "problems": collect_section("Problems", "Any problems?", PROBLEM_ITEMS),
-        "exceptional": collect_section("Exceptional", "Anything done exceptionally well?", EXCEPTIONAL_ITEMS),
+        "outcome": collect_outcome(),
+        "issues": collect_items("Issues", ISSUE_ITEMS),
+        "exceptional": collect_items("Exceptional", EXCEPTIONAL_ITEMS),
     }
-    print("\n== Overall description ==")
-    labels["overall_description"] = ask_text("  describe the overall outcome of the session")
 
     rubric = {
+        "rubric_version": 3,
         "session": {
             "id": info.get("id", session_id),
             "title": info.get("title", ""),
