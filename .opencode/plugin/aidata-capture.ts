@@ -56,13 +56,39 @@ const AidataCapture: Plugin = async (input, options) => {
   const systemSeen = new Map<string, Set<string>>()
   const toolDefs = new Map<string, { description: string; parameters: unknown }>()
   let toolDefsCache = ""
+  let lastWrittenSession: string | undefined
+  // tool.definition gives no sessionID, so we remember the most recent session
+  // seen by a session-aware hook and snapshot tool defs against it.
+  let currentSession: string | undefined
 
   const systemPath = (sessionID: string) => join(dir, `system-${sessionID}.json`)
+  const toolsPath = (sessionID: string) => join(dir, `tools-${sessionID}.json`)
+
+  const persistToolDefs = (sessionID?: string): void => {
+    if (!sessionID || toolDefs.size === 0) return
+    const serialized = JSON.stringify(Object.fromEntries(toolDefs), null, 2)
+    if (serialized === toolDefsCache && sessionID === lastWrittenSession) return
+    toolDefsCache = serialized
+    lastWrittenSession = sessionID
+    writeFileSync(toolsPath(sessionID), serialized)
+  }
 
   return {
+    // The only hook that reliably carries a sessionID before the model call, so
+    // it both marks the active session and snapshots the current tool defs.
+    "chat.params": async (hookInput) => {
+      try {
+        currentSession = hookInput.sessionID
+        persistToolDefs(currentSession)
+      } catch {
+        // ignore
+      }
+    },
+
     "experimental.chat.system.transform": async (hookInput, output) => {
       try {
         const sessionID = hookInput.sessionID ?? "unknown"
+        currentSession = hookInput.sessionID
         const system = Array.isArray(output.system) ? output.system : []
         if (system.length === 0) return
 
@@ -98,6 +124,7 @@ const AidataCapture: Plugin = async (input, options) => {
           record.prompts = record.prompts.slice(-MAX_PROMPTS_PER_SESSION)
         }
         writeFileSync(file, JSON.stringify(record, null, 2))
+        if (hookInput.sessionID) persistToolDefs(sessionID)
       } catch {
         // ignore
       }
@@ -109,11 +136,7 @@ const AidataCapture: Plugin = async (input, options) => {
           description: output.description,
           parameters: normalizeParameters(output.parameters),
         })
-        const serialized = JSON.stringify(Object.fromEntries(toolDefs), null, 2)
-        if (serialized !== toolDefsCache) {
-          toolDefsCache = serialized
-          writeFileSync(join(dir, "tool-definitions.json"), serialized)
-        }
+        persistToolDefs(currentSession)
       } catch {
         // ignore
       }
