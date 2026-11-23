@@ -5,6 +5,12 @@ Usage:
     python3 aidata.py start            # zip the repo per .ai_data_config -> src.zip
     python3 aidata.py end [--session ID] [--no-sanitize]
                                        # export the session, copy src.zip, label it, save rubric
+    python3 aidata.py rate <session-dir> --rater NAME [--all] [--force]
+                                       # add a second/later rater's labels to a session
+    python3 aidata.py agreement [--output PREFIX]
+                                       # inter-rater agreement (Cohen's kappa)
+    python3 aidata.py catalog [--output PREFIX]
+                                       # rewrite the whole-dataset overview (rerunnable)
 
 The "start" step reads .ai_data_config (gitignore-style) from the current repo
 and writes src.zip. The "end" step uses `opencode export` (CLI, no TUI needed)
@@ -20,6 +26,7 @@ Pass --no-sanitize to keep the raw data.
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -40,6 +47,8 @@ CONFIG_NAME = ".ai_data_config"
 ZIP_NAME = "src.zip"
 # where the .opencode/plugin/aidata-capture.ts plugin drops system prompt + tool defs
 CAPTURE_DIR = Path(os.environ.get("AIDATA_CAPTURE_DIR", Path.home() / ".local" / "share" / "opencode" / "aidata-capture"))
+# session categories live with the tool so the taxonomy is shared across every repo
+CATEGORIES_FILE = REPO_ROOT / "categories.txt"
 
 OUTCOME_CHOICES = [
     ("success", "succeeded - task fully accomplished"),
@@ -151,6 +160,59 @@ def collect_files(
     return sorted(found)
 
 
+def write_source_zip(
+    repo: Path, rules: list[tuple[bool, GitIgnoreSpecPattern]], out_path: Path
+) -> list[str]:
+    """Zip the repo per `rules` to `out_path`; returns the included relative paths."""
+    # never include our own artifacts (the start snapshot or this output)
+    exclude_files = {out_path.resolve(), (repo / ZIP_NAME).resolve()}
+    exclude_dirs: set[Path] = set()
+    if DATA_ROOT.resolve().is_relative_to(repo):
+        exclude_dirs.add(DATA_ROOT.resolve())
+    files = collect_files(repo, rules, exclude_files, exclude_dirs)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for rel in files:
+            zf.write(repo / rel, arcname=rel)
+    return files
+
+
+LANGUAGE_BY_EXT = {
+    ".py": "Python", ".js": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
+    ".ts": "TypeScript", ".tsx": "TypeScript", ".jsx": "JavaScript",
+    ".rs": "Rust", ".go": "Go", ".java": "Java", ".kt": "Kotlin", ".kts": "Kotlin",
+    ".c": "C", ".h": "C", ".cc": "C++", ".cpp": "C++", ".hpp": "C++", ".cs": "C#",
+    ".rb": "Ruby", ".php": "PHP", ".swift": "Swift", ".m": "Objective-C", ".scala": "Scala",
+    ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell", ".ps1": "PowerShell",
+    ".html": "HTML", ".css": "CSS", ".scss": "CSS", ".vue": "Vue", ".svelte": "Svelte",
+    ".sql": "SQL", ".r": "R", ".jl": "Julia", ".lua": "Lua", ".dart": "Dart",
+    ".ex": "Elixir", ".exs": "Elixir", ".clj": "Clojure", ".hs": "Haskell",
+    ".md": "Markdown", ".json": "JSON", ".yaml": "YAML", ".yml": "YAML",
+    ".toml": "TOML", ".xml": "XML", ".tex": "TeX", ".ipynb": "Jupyter", ".txt": "Text",
+}
+
+
+def repo_stats(zip_path: Path) -> dict:
+    """Summarize a source zip: file count, bytes, lines, and language mix."""
+    files = 0
+    total_bytes = 0
+    lines = 0
+    langs: Counter = Counter()
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            if info.filename.endswith("/"):
+                continue
+            files += 1
+            total_bytes += info.file_size
+            ext = PurePosixPath(info.filename).suffix.lower()
+            langs[LANGUAGE_BY_EXT.get(ext, "other")] += 1
+            text = decode_text(zf.read(info.filename))
+            if text is not None:
+                lines += text.count("\n") + (0 if (not text or text.endswith("\n")) else 1)
+    ordered = dict(langs.most_common())
+    return {"files": files, "bytes": total_bytes, "lines": lines, "languages": ordered}
+
+
 def cmd_start(args: argparse.Namespace) -> None:
     repo = Path(args.repo).expanduser().resolve()
     config = repo / CONFIG_NAME
@@ -227,16 +289,29 @@ REDACTION_RULES: list[dict] = [
         "scopes": BOTH,
         "repl": _assignment_repl,
     },
-    {"name": "email", "pattern": re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"), "scopes": TRANSCRIPT},
-    {"name": "home_path", "pattern": re.compile(r"/(?:home|Users)/[^/\s\"'\\]+"), "scopes": TRANSCRIPT},
+    # PII applies to the transcript *and* the captured source: code, license
+    # files, package manifests, and fixtures routinely embed author emails,
+    # home-directory paths, and contact numbers, so the src.zip pass needs them
+    # too. Patterns are kept conservative to avoid mangling ordinary code.
+    {"name": "email", "pattern": re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"), "scopes": BOTH, "pii": True},
+    {"name": "home_path", "pattern": re.compile(r"/(?:home|Users)/[^/\s\"'\\]+"), "scopes": BOTH, "pii": True},
+    {"name": "windows_home_path", "pattern": re.compile(r"(?i)\b[A-Z]:\\Users\\[^\\\s\"']+"), "scopes": BOTH, "pii": True},
+    {"name": "ssn", "pattern": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "scopes": BOTH, "pii": True},
+    {"name": "phone_e164", "pattern": re.compile(r"\+\d{7,15}\b"), "scopes": BOTH, "pii": True},
 ]
 
 
-def redact(text: str, scopes: frozenset[str]) -> tuple[str, Counter]:
-    """Apply every rule matching `scopes`, returning the new text and per-rule counts."""
+def redact(text: str, scopes: frozenset[str], include_pii: bool = True) -> tuple[str, Counter]:
+    """Apply every rule matching `scopes`, returning the new text and per-rule counts.
+
+    Set `include_pii=False` to apply only secret rules -- used for license files,
+    whose copyright notices (author emails) must be retained for attribution.
+    """
     counts: Counter = Counter()
     for rule in REDACTION_RULES:
         if not (rule["scopes"] & scopes):
+            continue
+        if rule.get("pii") and not include_pii:
             continue
         name = rule["name"]
         token = f"[REDACTED:{name}]"
@@ -288,7 +363,11 @@ def decode_text(raw: bytes) -> str | None:
 
 
 def sanitize_zip(zip_path: Path, scopes: frozenset[str]) -> dict[str, Counter]:
-    """Rewrite a zip in place, redacting text entries. Returns per-entry counts."""
+    """Rewrite a zip in place, redacting text entries. Returns per-entry counts.
+
+    License files keep their PII (copyright notices and author emails must be
+    retained for attribution); they still get secret redaction.
+    """
     per_entry: dict[str, Counter] = {}
     tmp = zip_path.with_name(zip_path.name + ".tmp")
     with zipfile.ZipFile(zip_path) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -298,7 +377,9 @@ def sanitize_zip(zip_path: Path, scopes: frozenset[str]) -> dict[str, Counter]:
             if text is None:
                 zout.writestr(info, raw)
                 continue
-            new, counts = redact(text, scopes)
+            # is_license_filename is defined below; resolved at call time.
+            keep_pii = is_license_filename(info.filename)
+            new, counts = redact(text, scopes, include_pii=not keep_pii)
             if counts:
                 per_entry[info.filename] = counts
             zout.writestr(info, new.encode("utf-8"))
@@ -378,6 +459,124 @@ def detect_spdx(text: str) -> list[str]:
     return seen
 
 
+# --------------------------------------------------------------------------- #
+# license risk scan: flag terms that may be incompatible with AI training data
+# --------------------------------------------------------------------------- #
+# Names (from signature detection or SPDX ids) that imply real obligations.
+LICENSE_NAME_NOTES: dict[str, str] = {
+    "AGPL-3.0": "network copyleft; strong obligations, frequently excluded from datasets",
+    "GPL-3.0": "strong copyleft; derivative works must remain GPL",
+    "GPL-2.0": "strong copyleft; derivative works must remain GPL",
+    "LGPL-3.0": "weak copyleft; check how the library is linked/used",
+    "MPL-2.0": "file-level copyleft; check redistribution terms",
+}
+
+# Keyword/prose patterns that suggest restrictive terms in license text.
+LICENSE_TEXT_RULES: list[tuple[str, re.Pattern]] = [
+    ("non-commercial restriction", re.compile(r"(?i)non[- ]?commercial")),
+    ("no-derivatives restriction", re.compile(r"(?i)no[- ]?derivatives?")),
+    ("share-alike obligation", re.compile(r"(?i)share[- ]?alike")),
+    (
+        "AI/ML/TDM restriction",
+        re.compile(
+            r"(?i)(?:no|not|prohibit|forbid|without|restrict)\w*[^.\n]{0,60}"
+            r"(?:\bai\b|a\.i\.|machine[- ]?learning|\bml\b|model training|text[- ]?(?:and|&)[- ]?data[- ]?mining|\btdm\b)"
+        ),
+    ),
+    (
+        "research/academic/evaluation-only",
+        re.compile(r"(?i)(?:research|academic|evaluation|personal|non-?profit)(?:\s+\w+){0,2}\s+only|only for (?:research|academic|evaluation|personal)"),
+    ),
+    ("redistribution prohibited", re.compile(r"(?i)\bno (?:re)?distribution\b|may not (?:be )?(?:re)?distribut")),
+    ("copyleft", re.compile(r"(?i)\bcopyleft\b")),
+]
+
+UNKNOWN_LICENSE_NOTE = "unrecognized license text; review manually"
+
+
+def scan_license_text(text: str) -> list[tuple[str, str]]:
+    """Return (kind, matched snippet) for every restrictive term found in `text`."""
+    found: list[tuple[str, str]] = []
+    for kind, pattern in LICENSE_TEXT_RULES:
+        match = pattern.search(text)
+        if match:
+            snippet = " ".join(match.group(0).split())
+            found.append((kind, snippet[:80]))
+    return found
+
+
+def name_notes(names: list[str]) -> list[str]:
+    """Return compatibility notes for detected license / SPDX names.
+
+    Matching is boundary-aware so e.g. "GPL-3.0" does not also fire for
+    "AGPL-3.0-only" or "LGPL-3.0".
+    """
+    notes: list[str] = []
+    for key, note in LICENSE_NAME_NOTES.items():
+        pattern = re.compile(rf"(?<![A-Za-z]){re.escape(key)}", re.IGNORECASE)
+        if any(pattern.search(name) for name in names):
+            notes.append(f"{key}: {note}")
+    return notes
+
+
+def scan_licenses(license_entries: list[dict], spdx_identifiers: list[dict]) -> list[dict]:
+    """Combine name- and text-based checks into a flat, de-duplicated list of findings.
+
+    `license_entries` items are {path, detected, text}.
+    """
+    findings: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add(path: str, kind: str, detail: str) -> None:
+        key = (path, kind, detail)
+        if key not in seen:
+            seen.add(key)
+            findings.append({"path": path, "kind": kind, "detail": detail})
+
+    for entry in license_entries:
+        path = entry["path"]
+        names = entry.get("detected") or []
+        for note in name_notes(names):
+            add(path, "restrictive license", note)
+        if not names:
+            add(path, "unknown license", UNKNOWN_LICENSE_NOTE)
+        for kind, snippet in scan_license_text(entry.get("text", "")):
+            add(path, kind, snippet)
+
+    for note in name_notes([e["license"] for e in spdx_identifiers]):
+        add("SPDX identifiers", "restrictive license", note)
+    return findings
+
+
+def _tint(text: str, style: str) -> str:
+    """Wrap `text` in an ANSI style when the terminal supports color."""
+    return f"{ANSI[style]}{text}{ANSI['reset']}" if color_enabled() else text
+
+
+def print_license_scan(findings: list[dict]) -> None:
+    """Green when clean, yellow for each potential AI-training incompatibility."""
+    if not findings:
+        print(_tint("license scan: clean - detected licenses look compatible with AI training data", "green"))
+        return
+    print(_tint(f"license scan: {len(findings)} potential incompatibility(ies) - review before selling", "yellow"))
+    for item in findings:
+        print(_tint(f"  ! {item['path']}: {item['kind']} - {item['detail']}", "yellow"))
+
+
+def render_license_findings_markdown(findings: list[dict]) -> list[str]:
+    lines = ["## Compatibility notes (AI training)", ""]
+    if not findings:
+        lines.append("No restrictive terms found; detected licenses look compatible.")
+        lines.append("")
+        return lines
+    lines.append(f"{len(findings)} potential issue(s) found - review before selling:")
+    lines.append("")
+    for item in findings:
+        lines.append(f"- `{item['path']}` - **{item['kind']}**: {item['detail']}")
+    lines.append("")
+    return lines
+
+
 def render_licenses_markdown(index: dict) -> str:
     lines = [f"# Licenses - {index['session_id']}", ""]
     lines.append(f"- **Generated:** {index['generated_at']}")
@@ -403,6 +602,7 @@ def render_licenses_markdown(index: dict) -> str:
         for entry in index["spdx_identifiers"]:
             lines.append(f"- `{entry['path']}` - {entry['license']}")
         lines.append("")
+    lines.extend(render_license_findings_markdown(index.get("risk_findings", [])))
     return "\n".join(lines)
 
 
@@ -410,6 +610,7 @@ def collect_licenses(zip_path: Path, outdir: Path, session_id: str) -> dict | No
     """Scan a source zip for license files and SPDX headers, copying them into licenses/."""
     license_files: list[dict] = []
     spdx_identifiers: list[dict] = []
+    scan_entries: list[dict] = []
     with zipfile.ZipFile(zip_path) as zf:
         for name in zf.namelist():
             if name.endswith("/"):
@@ -422,7 +623,9 @@ def collect_licenses(zip_path: Path, outdir: Path, session_id: str) -> dict | No
                 dest = outdir / "licenses" / "files" / name
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(raw)
-                license_files.append({"path": name, "detected": detect_license_text(text)})
+                detected = detect_license_text(text)
+                license_files.append({"path": name, "detected": detected})
+                scan_entries.append({"path": name, "detected": detected, "text": text})
             else:
                 for lic in detect_spdx(text):
                     spdx_identifiers.append({"path": name, "license": lic})
@@ -437,17 +640,161 @@ def collect_licenses(zip_path: Path, outdir: Path, session_id: str) -> dict | No
     for entry in spdx_identifiers:
         summary[entry["license"]] += 1
 
+    risk_findings = scan_licenses(scan_entries, spdx_identifiers)
+
     index = {
         "session_id": session_id,
         "generated_at": now_iso(),
         "license_files": license_files,
         "spdx_identifiers": spdx_identifiers,
         "summary": dict(summary),
+        "risk_findings": risk_findings,
     }
     licdir = outdir / "licenses"
     (licdir / "index.json").write_text(json.dumps(index, indent=2), encoding="utf-8")
     (licdir / "LICENSES.md").write_text(render_licenses_markdown(index), encoding="utf-8")
     return index
+
+
+# --------------------------------------------------------------------------- #
+# training release: an explicit grant so every capture states its AI-use terms
+# --------------------------------------------------------------------------- #
+TRAINING_RELEASE_NAME = "AI-TRAINING-RELEASE.md"
+TRAINING_RELEASE_OVERRIDE = ".ai_data_release.md"
+DEFAULT_GRANTOR = "William B Fowler"
+
+DEFAULT_TRAINING_RELEASE = """\
+# AI Training Release
+
+The copyright holder releases the source code and development-session artifacts
+in this folder for use as machine-learning **training, fine-tuning, and
+evaluation data**, including for training models that may compete with any model
+used to produce the session.
+
+This grant covers the accompanying `src.zip` and the captured session
+transcript, system prompt, tool definitions, and tool outputs.
+
+- **Session:** {session_id}
+- **Granted by:** {grantor}
+- **Generated:** {generated_at}
+
+Third-party licenses detected in `LICENSES.md` (if any) still apply to their
+respective files and are not superseded by this release.
+"""
+
+
+def training_release_text(repo: Path, session_id: str, grantor: str) -> str:
+    """Use the repo's `.ai_data_release.md` if present, else the default grant."""
+    override = repo / TRAINING_RELEASE_OVERRIDE
+    if override.is_file():
+        return override.read_text(encoding="utf-8")
+    return DEFAULT_TRAINING_RELEASE.format(
+        session_id=session_id, grantor=grantor, generated_at=now_iso()
+    )
+
+
+def write_training_release(repo: Path, outdir: Path, session_id: str, grantor: str) -> str:
+    licdir = outdir / "licenses"
+    licdir.mkdir(parents=True, exist_ok=True)
+    (licdir / TRAINING_RELEASE_NAME).write_text(
+        training_release_text(repo, session_id, grantor), encoding="utf-8"
+    )
+    return f"licenses/{TRAINING_RELEASE_NAME}"
+
+
+# --------------------------------------------------------------------------- #
+# third-party notices: attribution for opencode (whose prompt/tools we capture)
+# --------------------------------------------------------------------------- #
+THIRD_PARTY_NOTICES_NAME = "THIRD-PARTY-NOTICES.md"
+
+OPENCODE_LICENSE_TEXT = """\
+MIT License
+
+Copyright (c) 2025 opencode
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+THIRD_PARTY_NOTICES_TEMPLATE = """\
+# Third-party notices
+
+This capture was produced with **opencode**, the open-source coding agent
+(<https://github.com/anomalyco/opencode>). The captured system prompt and tool
+definitions originate from opencode and are redistributed here under the MIT
+License below. Any redistribution of those artifacts must retain this notice.
+
+"opencode" is a trademark of its owners. This dataset is neither affiliated
+with nor endorsed by the opencode project.
+
+## opencode
+
+{opencode_license}
+{deepseek_section}"""
+
+DEEPSEEK_PROVENANCE_TEMPLATE = """
+## DeepSeek
+
+Session outputs were generated by a DeepSeek model (`{model}`) through the
+DeepSeek Open Platform. Under section 4.2 of the DeepSeek Open Platform Terms
+of Service, DeepSeek assigns any rights in the Outputs to the user and expressly
+permits applying them to train other models (including model distillation). This
+dataset relies on that grant.
+
+- Source: DeepSeek Open Platform Terms of Service, section 4.2
+  <https://cdn.deepseek.com/policies/en-US/deepseek-open-platform-terms-of-service.html>
+
+"DeepSeek" is a trademark of Hangzhou DeepSeek Artificial Intelligence Co.,
+Ltd. This dataset is neither affiliated with nor endorsed by DeepSeek.
+
+Note: that grant is governed by the laws of the People's Republic of China and
+the terms may be revised over time.
+"""
+
+
+def deepseek_provenance(model: str) -> str:
+    """DeepSeek notice, but only when the session actually used a DeepSeek model."""
+    if "deepseek" not in model.lower():
+        return ""
+    return DEEPSEEK_PROVENANCE_TEMPLATE.format(model=model or "DeepSeek")
+
+
+def third_party_notices_text(model: str = "") -> str:
+    return THIRD_PARTY_NOTICES_TEMPLATE.format(
+        opencode_license=OPENCODE_LICENSE_TEXT,
+        deepseek_section=deepseek_provenance(model),
+    )
+
+
+def write_third_party_notices(outdir: Path, model: str = "") -> str:
+    licdir = outdir / "licenses"
+    licdir.mkdir(parents=True, exist_ok=True)
+    (licdir / THIRD_PARTY_NOTICES_NAME).write_text(third_party_notices_text(model), encoding="utf-8")
+    return f"licenses/{THIRD_PARTY_NOTICES_NAME}"
+
+
+def session_model(data: dict) -> str:
+    """First `<provider>/<modelID>` seen in an exported session, else ''."""
+    for message in data.get("messages", []) or []:
+        mi = message.get("info", {}) or {}
+        if mi.get("modelID"):
+            return f"{mi.get('providerID', '')}/{mi.get('modelID')}"
+    return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -509,7 +856,31 @@ def render_part(part: dict) -> str:
                 out = json.dumps(out, indent=2, ensure_ascii=False)
             chunks.append("Output:\n\n" + fence(out))
         return "\n\n".join(chunks)
-    if kind in ("step-start", "step-finish", "snapshot", "patch"):
+    if kind == "patch":
+        files = part.get("files") or []
+        h = (part.get("hash") or "")[:12]
+        header = f"**Patch** `{h}`" if h else "**Patch**"
+        body = "\n".join(f"- `{f}`" for f in files) or "_(no files listed)_"
+        return f"{header} - {len(files)} file(s) changed:\n\n{body}"
+    if kind == "snapshot":
+        snap = (part.get("snapshot") or "")[:12]
+        return f"*Snapshot:* `{snap}`" if snap else ""
+    if kind == "step-finish":
+        tokens = part.get("tokens") or {}
+        cost = part.get("cost")
+        bits: list[str] = []
+        if tokens:
+            bits.append(
+                f"tokens in={tokens.get('input', 0)} out={tokens.get('output', 0)} "
+                f"reasoning={tokens.get('reasoning', 0)}"
+            )
+            cache = tokens.get("cache") or {}
+            if cache:
+                bits.append(f"cache read={cache.get('read', 0)} write={cache.get('write', 0)}")
+        if cost is not None:
+            bits.append(f"cost=${cost}")
+        return f"_step finished: {', '.join(bits)}_" if bits else ""
+    if kind == "step-start":
         return ""
     text = part.get("text")
     return text.strip() if isinstance(text, str) else ""
@@ -545,6 +916,26 @@ def render_markdown(data: dict) -> str:
                 lines.append(rendered)
                 lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def render_final_state_markdown(final_state: dict, outdir: Path) -> str:
+    """Append the end-of-session state: the start-vs-end snapshot diff."""
+    if not final_state:
+        return ""
+    lines = ["", "---", "", "# Final repository state", ""]
+
+    if final_state.get("session_diff"):
+        diff_path = outdir / final_state["session_diff"]
+        if diff_path.is_file():
+            diff_text = diff_path.read_text(encoding="utf-8").strip()
+            lines.append("## Session changes (start -> end)")
+            lines.append("")
+            lines.append(fence(diff_text) if diff_text else "_(no changes)_")
+            lines.append("")
+    elif final_state.get("state_zip"):
+        lines.append("Full start/end snapshots are in `src.zip` and `final-state/state.zip`.")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def ask_multiselect(items: list[tuple[str, str]]) -> list[str]:
@@ -583,6 +974,70 @@ def ask_choice(question: str, items: list[tuple[str, str]]) -> tuple[str, str]:
         if raw.isdigit() and 1 <= int(raw) <= len(items):
             return items[int(raw) - 1]
         print("  invalid input")
+
+
+def slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")
+    return slug or "uncategorized"
+
+
+def load_categories() -> list[str]:
+    """Read categories.txt (one label per line); fall back to a minimal default."""
+    categories: list[str] = []
+    if CATEGORIES_FILE.is_file():
+        for raw in CATEGORIES_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                categories.append(line)
+    return categories or ["Coding", "Non-coding"]
+
+
+def add_category(label: str) -> bool:
+    """Append a new category to categories.txt. Returns True if it was added.
+
+    De-duplicates case-insensitively and never raises: an unwritable install
+    dir (read-only, permissions) just means the category isn't remembered.
+    """
+    label = " ".join(label.split())
+    if not label or any(c.lower() == label.lower() for c in load_categories()):
+        return False
+    try:
+        if CATEGORIES_FILE.is_file():
+            text = CATEGORIES_FILE.read_text(encoding="utf-8")
+            prefix = "" if (not text or text.endswith("\n")) else "\n"
+            with CATEGORIES_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(f"{prefix}{label}\n")
+        else:
+            CATEGORIES_FILE.write_text(
+                "# Session categories for the aidata rubric. One per line.\n" + label + "\n",
+                encoding="utf-8",
+            )
+        return True
+    except OSError as exc:  # noqa: BLE001
+        print(f"  note: could not update {CATEGORIES_FILE.name}: {exc}", file=sys.stderr)
+        return False
+
+
+def collect_category() -> dict:
+    print("\n== Category ==")
+    categories = load_categories()
+    items = [(slugify(c), c) for c in categories] + [("__other__", "other (describe)")]
+    key, label = ask_choice("What best describes this session?", items)
+    if key == "__other__":
+        custom = ask_text("  describe the category")
+        if add_category(custom):
+            print(f"  added '{custom}' to {CATEGORIES_FILE.name} (now offered in future sessions)")
+        return {"value": slugify(custom), "label": custom, "custom": True}
+    return {"value": key, "label": label, "custom": False}
+
+
+def collect_difficulty() -> dict:
+    print("\n== Difficulty ==")
+    while True:
+        raw = input("  rate difficulty 1-10 (1 = trivial, 10 = very hard): ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= 10:
+            return {"value": int(raw)}
+        print("  enter a number from 1 to 10")
 
 
 def collect_outcome() -> dict:
@@ -627,7 +1082,19 @@ def render_rubric_markdown(rubric: dict) -> str:
     lines = [f"# Rubric - {rubric['session']['id']}", ""]
     lines.append(f"- **Directory:** {rubric['session'].get('directory', '')}")
     lines.append(f"- **Model:** {rubric['session'].get('model', '')}")
-    lines.append(f"- **Labeled at:** {rubric['labeled_at']}")
+    lines.append(f"- **Labeled at:** {rubric.get('labeled_at', '')}")
+    category = labels.get("category")
+    if category:
+        lines.append(f"- **Category:** {category.get('label', category.get('value', ''))}")
+    difficulty = labels.get("difficulty")
+    if difficulty:
+        lines.append(f"- **Difficulty:** {difficulty.get('value')}/10")
+    stats = rubric.get("source_stats")
+    if stats:
+        langs = ", ".join(list(stats.get("languages", {}))[:5])
+        lines.append(f"- **Source:** {stats.get('files', 0)} files, {stats.get('bytes', 0):,} bytes, {stats.get('lines', 0):,} lines")
+        if langs:
+            lines.append(f"- **Languages:** {langs}")
     lines.append("")
 
     outcome = labels["outcome"]
@@ -685,7 +1152,83 @@ def copy_capture_artifacts(session_id: str, outdir: Path) -> dict[str, str]:
     if tool_file.is_file():
         shutil.copy2(tool_file, outdir / "tool-definitions.json")
         copied["tool_definitions"] = "tool-definitions.json"
+    params_file = CAPTURE_DIR / f"params-{session_id}.json"
+    if params_file.is_file():
+        shutil.copy2(params_file, outdir / "sampling-params.json")
+        copied["sampling_params"] = "sampling-params.json"
     return copied
+
+
+def _zip_entries(zip_path: Path) -> dict[str, bytes]:
+    with zipfile.ZipFile(zip_path) as zf:
+        return {i.filename: zf.read(i.filename) for i in zf.infolist() if not i.filename.endswith("/")}
+
+
+def session_diff(start_zip: Path, end_zip: Path, max_diff_bytes: int = 2_000_000) -> str:
+    """Unified diff between two source snapshots, independent of git.
+
+    Text files get a real unified diff; binary or very large changes are noted
+    by name only.
+    """
+    start = _zip_entries(start_zip)
+    end = _zip_entries(end_zip)
+    added = sorted(set(end) - set(start))
+    removed = sorted(set(start) - set(end))
+    changed = sorted(n for n in set(start) & set(end) if start[n] != end[n])
+
+    header = [
+        "# Session changes (start -> end)",
+        "",
+        f"- added: {len(added)}, removed: {len(removed)}, changed: {len(changed)}",
+        "",
+    ]
+    if not (added or removed or changed):
+        return "\n".join(header + ["_no changes_", ""])
+
+    lines: list[str] = []
+    for name in added:
+        lines.append(f"+++ added: {name}")
+    for name in removed:
+        lines.append(f"--- removed: {name}")
+    for name in changed:
+        ta = decode_text(start[name])
+        tb = decode_text(end[name])
+        if ta is None or tb is None:
+            lines.append(f"### binary changed: {name}")
+            continue
+        if len(start[name]) + len(end[name]) > max_diff_bytes:
+            lines.append(f"### changed (too large to diff): {name}")
+            continue
+        lines.append("")
+        lines.extend(
+            difflib.unified_diff(
+                ta.splitlines(),
+                tb.splitlines(),
+                fromfile=f"a/{name}",
+                tofile=f"b/{name}",
+                lineterm="",
+            )
+        )
+    return "\n".join(header + lines) + "\n"
+
+
+def capture_final_state(repo: Path, outdir: Path, start_zip: Path | None = None) -> dict:
+    """Record the repo state at `end`: a final snapshot and a start-vs-end diff."""
+    final = outdir / "final-state"
+    final.mkdir(parents=True, exist_ok=True)
+    result: dict = {"dir": "final-state"}
+
+    config = repo / CONFIG_NAME
+    if config.is_file():
+        rules = load_rules(config)
+        files = write_source_zip(repo, rules, final / "state.zip")
+        result["state_zip"] = "final-state/state.zip"
+        result["state_files"] = len(files)
+
+    if start_zip and start_zip.is_file() and (final / "state.zip").is_file():
+        (final / "session.diff.patch").write_text(session_diff(start_zip, final / "state.zip"), encoding="utf-8")
+        result["session_diff"] = "final-state/session.diff.patch"
+    return result
 
 
 def cmd_end(args: argparse.Namespace) -> None:
@@ -732,6 +1275,12 @@ def cmd_end(args: argparse.Namespace) -> None:
     else:
         print("note: no system-prompt/tool-definitions found (is the aidata plugin installed and loaded?)")
 
+    final_state = capture_final_state(repo, outdir, start_zip=outdir / ZIP_NAME if src_copied else None)
+    if final_state.get("session_diff"):
+        print("captured final state -> final-state/ (snapshot + session diff)")
+    else:
+        print("captured final state -> final-state/ (snapshot only; no start src.zip)")
+
     if args.sanitize:
         data, counts = sanitize_data(data, TRANSCRIPT)
         record(f"{stem}.json", counts)
@@ -753,11 +1302,22 @@ def cmd_end(args: argparse.Namespace) -> None:
             new, counts = redact(path.read_text(encoding="utf-8"), TRANSCRIPT)
             path.write_text(new, encoding="utf-8")
             record(fname, counts)
+        final_dir = outdir / "final-state"
+        if final_dir.is_dir():
+            diff_path = final_dir / "session.diff.patch"
+            if diff_path.is_file():
+                new, counts = redact(diff_path.read_text(encoding="utf-8"), SOURCE)
+                diff_path.write_text(new, encoding="utf-8")
+                record("final-state/session.diff.patch", counts)
+            state_zip = final_dir / "state.zip"
+            if state_zip.is_file():
+                for name, entry_counts in sanitize_zip(state_zip, SOURCE).items():
+                    record(f"final-state/state.zip:{name}", entry_counts)
 
     json_path = outdir / f"{stem}.json"
     md_path = outdir / f"{stem}.md"
     json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    md_path.write_text(render_markdown(data), encoding="utf-8")
+    md_path.write_text(render_markdown(data) + render_final_state_markdown(final_state, outdir), encoding="utf-8")
     print(f"wrote {md_path.name} and {json_path.name}")
 
     license_info = None
@@ -768,6 +1328,13 @@ def cmd_end(args: argparse.Namespace) -> None:
         else:
             print("no license files or SPDX identifiers found in source")
 
+    print_license_scan(license_info.get("risk_findings", []) if license_info else [])
+
+    release_rel = write_training_release(repo, outdir, session_id, args.grantor)
+    print(f"wrote {release_rel}")
+    notices_rel = write_third_party_notices(outdir, session_model(data))
+    print(f"wrote {notices_rel}")
+
     if args.sanitize:
         write_sanitize_report(outdir, sanitize_report)
         total = sum(sanitize_report["totals"].values())
@@ -777,22 +1344,25 @@ def cmd_end(args: argparse.Namespace) -> None:
             print("sanitize: nothing sensitive found")
 
     info = data.get("info", {}) or {}
-    messages = data.get("messages", []) or []
-    model = ""
-    for message in messages:
-        mi = message.get("info", {}) or {}
-        if mi.get("modelID"):
-            model = f"{mi.get('providerID', '')}/{mi.get('modelID')}"
-            break
+    model = session_model(data)
 
     labels = {
+        "category": collect_category(),
+        "difficulty": collect_difficulty(),
         "outcome": collect_outcome(),
         "issues": collect_items("Issues", ISSUE_ITEMS),
         "exceptional": collect_items("Exceptional", EXCEPTIONAL_ITEMS),
     }
 
+    source_stats = None
+    if src_copied:
+        try:
+            source_stats = repo_stats(outdir / ZIP_NAME)
+        except Exception as exc:  # noqa: BLE001
+            print(f"warning: could not compute source stats: {exc}", file=sys.stderr)
+
     rubric = {
-        "rubric_version": 3,
+        "rubric_version": 4,
         "session": {
             "id": info.get("id", session_id),
             "title": info.get("title", ""),
@@ -802,14 +1372,20 @@ def cmd_end(args: argparse.Namespace) -> None:
             "version": info.get("version", ""),
         },
         "repo": str(repo),
+        "source_stats": source_stats,
+        "final_state": final_state,
         "artifacts": {
             "session_md": md_path.name,
             "session_json": json_path.name,
             "source_zip": ZIP_NAME if src_copied else None,
             "system_prompt": capture.get("system_prompt"),
             "tool_definitions": capture.get("tool_definitions"),
+            "sampling_params": capture.get("sampling_params"),
             "tool_outputs": tool_outputs or None,
             "licenses": "licenses" if license_info else None,
+            "training_release": release_rel,
+            "third_party_notices": notices_rel,
+            "final_state": "final-state" if final_state else None,
             "sanitize_report": "sanitize-report.json" if args.sanitize else None,
         },
         "labels": labels,
@@ -819,6 +1395,557 @@ def cmd_end(args: argparse.Namespace) -> None:
     (outdir / "rubric.json").write_text(json.dumps(rubric, indent=2, ensure_ascii=False), encoding="utf-8")
     (outdir / "rubric.md").write_text(render_rubric_markdown(rubric), encoding="utf-8")
     print(f"\nsaved rubric.json and rubric.md to {outdir}")
+
+
+# --------------------------------------------------------------------------- #
+# rate: add a second (or later) rater's labels to a captured session
+# --------------------------------------------------------------------------- #
+RATINGS_DIR = "ratings"
+PRIMARY_RATER = "rater1"
+
+
+def session_dirs() -> list[Path]:
+    if not DATA_ROOT.is_dir():
+        return []
+    return sorted(p for p in DATA_ROOT.iterdir() if p.is_dir() and (p / "rubric.json").is_file())
+
+
+def flagged_keys(section: dict) -> set[str]:
+    return {k for k, v in section.get("items", {}).items() if v.get("marked") == "yes"}
+
+
+def rating_view(labels: dict) -> dict:
+    """Reduce a label set to what agreement needs: values + flagged keys.
+
+    `category` is optional so rubric files written before the category field
+    existed still load.
+    """
+    return {
+        "category": (labels.get("category") or {}).get("value"),
+        "outcome": labels["outcome"]["value"],
+        "issues": flagged_keys(labels["issues"]),
+        "exceptional": flagged_keys(labels["exceptional"]),
+    }
+
+
+def load_session_ratings(sdir: Path) -> dict[str, dict]:
+    """Return {rater_name: rating_view} for a session folder.
+
+    The original `rubric.json` is the primary rating; extra raters live in
+    `<session>/ratings/<name>.json` so one session can accumulate several.
+    """
+    ratings: dict[str, dict] = {}
+    rubric_path = sdir / "rubric.json"
+    if rubric_path.is_file():
+        rubric = json.loads(rubric_path.read_text(encoding="utf-8"))
+        ratings[rubric.get("rater") or PRIMARY_RATER] = rating_view(rubric["labels"])
+    rdir = sdir / RATINGS_DIR
+    if rdir.is_dir():
+        for path in sorted(rdir.glob("*.json")):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            ratings[path.stem] = rating_view(data["labels"])
+    return ratings
+
+
+# --------------------------------------------------------------------------- #
+# markdown rendering: colorize a transcript for the terminal
+# --------------------------------------------------------------------------- #
+ANSI = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "italic": "\033[3m",
+    "underline": "\033[4m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "bright_cyan": "\033[96m",
+}
+
+INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+BOLD_RE = re.compile(r"\*\*([^*\n]+)\*\*")
+ITALIC_RE = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
+LINK_RE = re.compile(r"\[([^\]\n]+)\]\(([^)\n]+)\)")
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+LIST_RE = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$")
+QUOTE_RE = re.compile(r"^(\s*>+\s?)(.*)$")
+RULE_RE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
+
+
+def color_enabled(force_off: bool = False) -> bool:
+    """Color only on a TTY, and respect the NO_COLOR convention."""
+    if force_off or os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def _inline(text: str) -> str:
+    """Style inline spans without letting later patterns match inserted escapes.
+
+    Replacements are stashed as NUL-delimited placeholders first (ANSI escapes
+    contain `[`, which the link pattern would otherwise swallow), then expanded.
+    """
+    tokens: list[str] = []
+
+    def stash(styled: str) -> str:
+        tokens.append(styled)
+        return f"\x00{len(tokens) - 1}\x00"
+
+    text = INLINE_CODE_RE.sub(lambda m: stash(f"{ANSI['yellow']}{m.group(1)}{ANSI['reset']}"), text)
+    text = BOLD_RE.sub(lambda m: stash(f"{ANSI['bold']}{m.group(1)}{ANSI['reset']}"), text)
+    text = ITALIC_RE.sub(lambda m: stash(f"{ANSI['italic']}{m.group(1)}{ANSI['reset']}"), text)
+    text = LINK_RE.sub(
+        lambda m: stash(
+            f"{ANSI['underline']}{ANSI['blue']}{m.group(1)}{ANSI['reset']}{ANSI['dim']} ({m.group(2)}){ANSI['reset']}"
+        ),
+        text,
+    )
+    expand = re.compile(r"\x00(\d+)\x00")
+    previous = None
+    while previous != text:
+        previous = text
+        text = expand.sub(lambda m: tokens[int(m.group(1))], text)
+    return text
+
+
+def colorize_markdown(text: str) -> str:
+    """Return `text` with ANSI colors for headings, code, lists, quotes, and tables."""
+    out: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if FENCE_RE.match(line):
+            out.append(f"{ANSI['dim']}{line}{ANSI['reset']}")
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            out.append(f"{ANSI['green']}{line}{ANSI['reset']}")
+            continue
+        if RULE_RE.match(line):
+            out.append(f"{ANSI['dim']}{line}{ANSI['reset']}")
+            continue
+        heading = HEADING_RE.match(line)
+        if heading:
+            level = len(heading.group(1))
+            color = ANSI["bright_cyan"] if level == 1 else ANSI["cyan"] if level == 2 else ANSI["blue"]
+            out.append(f"{ANSI['bold']}{color}{_inline(heading.group(2))}{ANSI['reset']}")
+            continue
+        quote = QUOTE_RE.match(line)
+        if quote:
+            out.append(f"{ANSI['dim']}{quote.group(1)}{ANSI['reset']}{ANSI['italic']}{_inline(quote.group(2))}{ANSI['reset']}")
+            continue
+        if line.lstrip().startswith("|"):
+            out.append(f"{ANSI['dim']}{_inline(line)}{ANSI['reset']}")
+            continue
+        item = LIST_RE.match(line)
+        if item:
+            out.append(f"{item.group(1)}{ANSI['magenta']}{item.group(2)}{ANSI['reset']} {_inline(item.group(3))}")
+            continue
+        out.append(_inline(line))
+    return "\n".join(out)
+
+
+def print_markdown(text: str, color: bool = True) -> None:
+    print(colorize_markdown(text) if color else text)
+
+
+def cmd_rate(args: argparse.Namespace) -> None:
+    if args.all:
+        targets = session_dirs()
+        if not targets:
+            die(f"no captured sessions under {DATA_ROOT}")
+    elif args.session_dir:
+        targets = [Path(args.session_dir).expanduser().resolve()]
+    else:
+        die("pass a session folder or --all")
+
+    for sdir in targets:
+        rubric_path = sdir / "rubric.json"
+        if not rubric_path.is_file():
+            print(f"skip {sdir}: no rubric.json")
+            continue
+        rubric = json.loads(rubric_path.read_text(encoding="utf-8"))
+        out = sdir / RATINGS_DIR / f"{args.rater}.json"
+        if out.exists() and not args.force:
+            print(f"skip {sdir}: {out.name} already exists (use --force to overwrite)")
+            continue
+
+        session = rubric.get("session", {})
+        transcript = (rubric.get("artifacts") or {}).get("session_md")
+        print(f"\n=== Rater '{args.rater}' on {sdir.name} ===")
+        print(f"  session : {session.get('title', '')}")
+        print(f"  model   : {session.get('model', '')}")
+        if transcript and not args.no_transcript:
+            tpath = sdir / transcript
+            print(f"  review  : {tpath}")
+            if tpath.is_file():
+                print("\n" + "=" * 72)
+                print_markdown(tpath.read_text(encoding="utf-8"), color=color_enabled(args.no_color))
+                print("=" * 72)
+            else:
+                print(f"  warning: transcript {tpath} not found")
+        elif transcript:
+            print(f"  review  : {sdir / transcript} (not printed; --no-transcript)")
+        print("\nRead the transcript above, then answer the rubric (labels are hidden to avoid bias).")
+
+        labels = {
+            "category": collect_category(),
+            "difficulty": collect_difficulty(),
+            "outcome": collect_outcome(),
+            "issues": collect_items("Issues", ISSUE_ITEMS),
+            "exceptional": collect_items("Exceptional", EXCEPTIONAL_ITEMS),
+        }
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            json.dumps(
+                {
+                    "rubric_version": rubric.get("rubric_version", 3),
+                    "rater": args.rater,
+                    "session": session,
+                    "labels": labels,
+                    "labeled_at": now_iso(),
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        print(f"  saved {out}")
+
+
+# --------------------------------------------------------------------------- #
+# agreement: inter-rater agreement (Cohen's kappa)
+# --------------------------------------------------------------------------- #
+def cohen_kappa(a: list, b: list) -> float | None:
+    n = len(a)
+    if n == 0:
+        return None
+    cats = set(a) | set(b)
+    po = sum(x == y for x, y in zip(a, b)) / n
+    pe = sum((a.count(c) / n) * (b.count(c) / n) for c in cats)
+    if pe >= 1.0:
+        return 1.0 if po == 1.0 else 0.0
+    return (po - pe) / (1 - pe)
+
+
+def kappa_label(k: float | None) -> str:
+    if k is None:
+        return "n/a"
+    if k < 0:
+        return "poor"
+    if k < 0.21:
+        return "slight"
+    if k < 0.41:
+        return "fair"
+    if k < 0.61:
+        return "moderate"
+    if k < 0.81:
+        return "substantial"
+    return "almost perfect"
+
+
+def pair_agreement(sessions: list[dict], r1: str, r2: str) -> dict:
+    """`sessions` is a list of {rater_name: rating_view}; compare two raters."""
+    paired = [s for s in sessions if r1 in s and r2 in s]
+    if not paired:
+        return {"n": 0}
+
+    a = [s[r1]["outcome"] for s in paired]
+    b = [s[r2]["outcome"] for s in paired]
+    outcome = {
+        "n": len(paired),
+        "agree": sum(x == y for x, y in zip(a, b)),
+        "kappa": cohen_kappa(a, b),
+    }
+
+    cats = [(s[r1]["category"], s[r2]["category"]) for s in paired]
+    cats = [(x, y) for x, y in cats if x is not None and y is not None]
+    category = {
+        "n": len(cats),
+        "agree": sum(x == y for x, y in cats),
+        "kappa": cohen_kappa([x for x, _ in cats], [y for _, y in cats]) if cats else None,
+    }
+
+    result: dict = {"n": len(paired), "outcome": outcome, "category": category, "items": {}}
+    for dim, items in (("issues", ISSUE_ITEMS), ("exceptional", EXCEPTIONAL_ITEMS)):
+        a_bits: list[int] = []
+        b_bits: list[int] = []
+        per_item: dict[str, dict] = {}
+        for key, _ in items:
+            ia = [1 if key in s[r1][dim] else 0 for s in paired]
+            ib = [1 if key in s[r2][dim] else 0 for s in paired]
+            a_bits.extend(ia)
+            b_bits.extend(ib)
+            per_item[key] = {
+                "agree": sum(x == y for x, y in zip(ia, ib)),
+                "n": len(paired),
+                "kappa": cohen_kappa(ia, ib),
+            }
+        # aggregate kappa is undefined when neither rater ever raised a flag
+        result["items"][dim] = {
+            "n": len(a_bits),
+            "agree": sum(x == y for x, y in zip(a_bits, b_bits)),
+            "kappa": cohen_kappa(a_bits, b_bits) if (any(a_bits) or any(b_bits)) else None,
+            "per_item": per_item,
+        }
+    return result
+
+
+def fmt_pct(hit: int, total: int) -> str:
+    return f"{100 * hit / total:.1f}%" if total else "n/a"
+
+
+def fmt_kappa(k: float | None) -> str:
+    return f"{k:.3f} ({kappa_label(k)})" if k is not None else "n/a"
+
+
+def render_agreement_markdown(report: dict) -> str:
+    lines = ["# Inter-rater agreement", ""]
+    lines.append(f"- **Generated:** {report['generated_at']}")
+    lines.append(f"- **Sessions scanned:** {report['sessions_scanned']}")
+    lines.append(f"- **Raters:** {', '.join(report['raters']) or 'none'}")
+    lines.append("")
+    lines.append("> Cohen's kappa: >0.8 almost perfect, 0.6-0.8 substantial, 0.4-0.6 moderate, 0.2-0.4 fair, <0.2 slight.")
+    lines.append("> Items that neither rater ever flagged still read as 1.000; judge overall label quality by the pooled kappa.")
+    lines.append("")
+    if not report["pairs"]:
+        lines.append("No session has ratings from two or more raters yet.")
+        lines.append("")
+        lines.append("Add one with: `aidata rate <session-dir> --rater NAME`")
+        lines.append("")
+        return "\n".join(lines)
+
+    for pair in report["pairs"]:
+        res = pair["result"]
+        lines.append(f"## {pair['rater_a']} vs {pair['rater_b']}")
+        lines.append("")
+        lines.append(f"Compared on {res['n']} session(s).")
+        lines.append("")
+        cat = res.get("category") or {"n": 0, "agree": 0, "kappa": None}
+        if cat["n"]:
+            lines.append("### Category")
+            lines.append("")
+            lines.append(f"- agreement: {fmt_pct(cat['agree'], cat['n'])} ({cat['agree']}/{cat['n']})")
+            lines.append(f"- Cohen's kappa: {fmt_kappa(cat['kappa'])}")
+            lines.append("")
+        o = res["outcome"]
+        lines.append("### Outcome (success / partial / fail)")
+        lines.append("")
+        lines.append(f"- agreement: {fmt_pct(o['agree'], o['n'])} ({o['agree']}/{o['n']})")
+        lines.append(f"- Cohen's kappa: {fmt_kappa(o['kappa'])}")
+        lines.append("")
+        for dim, title in (("issues", "Issue flags"), ("exceptional", "Exceptional flags")):
+            it = res["items"][dim]
+            lines.append(f"### {title} (binary, all item decisions pooled)")
+            lines.append("")
+            lines.append(f"- agreement: {fmt_pct(it['agree'], it['n'])} ({it['agree']}/{it['n']})")
+            lines.append(f"- Cohen's kappa: {fmt_kappa(it['kappa'])}")
+            lines.append("")
+            lines.append("| item | agreement | kappa |")
+            lines.append("| --- | ---: | ---: |")
+            for key, stat in it["per_item"].items():
+                lines.append(f"| {key} | {fmt_pct(stat['agree'], stat['n'])} | {fmt_kappa(stat['kappa'])} |")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_agreement(args: argparse.Namespace) -> None:
+    dirs = session_dirs()
+    if not dirs:
+        die(f"no captured sessions under {DATA_ROOT}")
+
+    sessions: list[dict] = []
+    all_raters: set[str] = set()
+    for sdir in dirs:
+        ratings = load_session_ratings(sdir)
+        if ratings:
+            sessions.append(ratings)
+            all_raters.update(ratings)
+
+    raters = sorted(all_raters)
+    pairs = []
+    for i in range(len(raters)):
+        for j in range(i + 1, len(raters)):
+            result = pair_agreement(sessions, raters[i], raters[j])
+            if result["n"]:
+                pairs.append({"rater_a": raters[i], "rater_b": raters[j], "result": result})
+
+    report = {
+        "generated_at": now_iso(),
+        "sessions_scanned": len(dirs),
+        "raters": raters,
+        "pairs": pairs,
+    }
+
+    outbase = Path(args.output).expanduser().resolve() if args.output else DATA_ROOT / "agreement"
+    outbase.parent.mkdir(parents=True, exist_ok=True)
+    (outbase.with_suffix(".json")).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    md = render_agreement_markdown(report)
+    (outbase.with_suffix(".md")).write_text(md, encoding="utf-8")
+    print(md)
+    print(f"\nwrote {outbase.with_suffix('.md')} and {outbase.with_suffix('.json')}")
+
+
+# --------------------------------------------------------------------------- #
+# catalog: rerunnable dataset overview across every captured session
+# --------------------------------------------------------------------------- #
+def catalog_rows() -> list[dict]:
+    rows: list[dict] = []
+    for sdir in session_dirs():
+        rubric = json.loads((sdir / "rubric.json").read_text(encoding="utf-8"))
+        labels = rubric.get("labels", {})
+        session = rubric.get("session", {})
+        stats = rubric.get("source_stats") or {}
+        rdir = sdir / RATINGS_DIR
+        ratings = sorted(p.stem for p in rdir.glob("*.json")) if rdir.is_dir() else []
+        rows.append(
+            {
+                "dir": sdir.name,
+                "id": session.get("id", ""),
+                "title": session.get("title", ""),
+                "category": (labels.get("category") or {}).get("value"),
+                "difficulty": (labels.get("difficulty") or {}).get("value"),
+                "outcome": (labels.get("outcome") or {}).get("value"),
+                "model": session.get("model", ""),
+                "files": stats.get("files"),
+                "bytes": stats.get("bytes"),
+                "lines": stats.get("lines"),
+                "languages": list(stats.get("languages", {}).keys()),
+                "issues": len(flagged_keys(labels.get("issues", {}))),
+                "raters": 1 + len(ratings),
+            }
+        )
+    return rows
+
+
+def render_catalog_markdown(rows: list[dict]) -> str:
+    lines = ["# Dataset catalog", ""]
+    lines.append(f"- **Sessions:** {len(rows)}")
+    lines.append(f"- **Generated:** {now_iso()}")
+    if not rows:
+        lines.append("")
+        lines.append("No captured sessions yet.")
+        return "\n".join(lines) + "\n"
+
+    def tally(key: str) -> str:
+        counts = Counter(r[key] for r in rows if r.get(key))
+        return ", ".join(f"{k}: {v}" for k, v in counts.most_common()) or "n/a"
+
+    lines.append(f"- **By category:** {tally('category')}")
+    lines.append(f"- **By outcome:** {tally('outcome')}")
+    lines.append(f"- **By model:** {tally('model')}")
+    lines.append(f"- **Total source:** {sum(r['bytes'] or 0 for r in rows):,} bytes, {sum(r['lines'] or 0 for r in rows):,} lines")
+    diffs = [r["difficulty"] for r in rows if r.get("difficulty")]
+    if diffs:
+        lines.append(f"- **Difficulty:** avg {sum(diffs) / len(diffs):.1f}/10 (n={len(diffs)})")
+    lines.append("")
+    lines.append("| dir | title | category | diff | outcome | model | files | lines | languages | issues | raters |")
+    lines.append("| --- | --- | --- | ---: | --- | --- | ---: | ---: | --- | ---: | ---: |")
+    for r in sorted(rows, key=lambda x: x["dir"]):
+        diff = r["difficulty"] if r["difficulty"] is not None else ""
+        lines.append(
+            f"| {r['dir']} | {r['title'][:40]} | {r['category'] or ''} | {diff} | {r['outcome'] or ''} | "
+            f"{r['model'] or ''} | {r['files'] if r['files'] is not None else ''} | "
+            f"{r['lines'] if r['lines'] is not None else ''} | {', '.join(r['languages'][:3])} | {r['issues']} | {r['raters']} |"
+        )
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_catalog(args: argparse.Namespace) -> None:
+    unpack_sessions(DATA_ROOT)
+    rows = catalog_rows()
+    outbase = Path(args.output).expanduser().resolve() if args.output else DATA_ROOT / "CATALOG"
+    outbase.parent.mkdir(parents=True, exist_ok=True)
+    (outbase.with_suffix(".json")).write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+    md = render_catalog_markdown(rows)
+    (outbase.with_suffix(".md")).write_text(md, encoding="utf-8")
+    print(md)
+    print(f"wrote {outbase.with_suffix('.md')} and {outbase.with_suffix('.json')}")
+
+
+# --------------------------------------------------------------------------- #
+# pack / unpack: archive captured sessions for cheap storage
+# --------------------------------------------------------------------------- #
+def _safe_extract(zip_path: Path, dest: Path) -> None:
+    dest = dest.resolve()
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in zf.infolist():
+            target = (dest / member.filename).resolve()
+            if not target.is_relative_to(dest):
+                die(f"refusing unsafe path in {zip_path}: {member.filename}")
+        zf.extractall(dest)
+
+
+def cmd_pack(args: argparse.Namespace) -> None:
+    data_dir = Path(args.data_dir).expanduser()
+    if not data_dir.is_dir():
+        die(f"no such directory: {data_dir}")
+
+    dirs = sorted(p for p in data_dir.glob("session-*") if p.is_dir())
+    if not dirs:
+        print(f"no session-* directories found in {data_dir}")
+        return
+
+    packed = 0
+    for session_dir in dirs:
+        name = session_dir.name
+        zip_path = data_dir / f"{name}.zip"
+        if zip_path.exists() and not args.force:
+            print(f"skip {name} (archive exists; use --force to overwrite)")
+            continue
+        print(f"packing {name} ...")
+        zip_path.unlink(missing_ok=True)
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file in sorted(session_dir.rglob("*")):
+                if file.is_file():
+                    zf.write(file, arcname=file.relative_to(data_dir).as_posix())
+        bad = zipfile.ZipFile(zip_path).testzip()
+        if bad:
+            die(f"archive failed verification: {zip_path} ({bad})")
+        if not args.keep:
+            shutil.rmtree(session_dir)
+        packed += 1
+    print(f"done: {packed} archive(s) written to {data_dir}")
+
+
+def unpack_sessions(data_dir: Path, force: bool = False) -> int:
+    """Extract every session-*.zip in `data_dir` back to a folder.
+
+    Each archive is removed once it has been safely unpacked. Returns the number
+    of archives extracted.
+    """
+    if not data_dir.is_dir():
+        return 0
+
+    unpacked = 0
+    for zip_path in sorted(data_dir.glob("session-*.zip")):
+        name = zip_path.stem
+        target = data_dir / name
+        if target.exists() and not force:
+            print(f"skip {name} (directory exists; use --force to overwrite)")
+            continue
+        print(f"unpacking {name} ...")
+        if target.exists():
+            shutil.rmtree(target)
+        _safe_extract(zip_path, data_dir)
+        zip_path.unlink()
+        unpacked += 1
+    if unpacked:
+        print(f"done: {unpacked} archive(s) extracted to {data_dir}")
+    return unpacked
+
+
+def cmd_unpack(args: argparse.Namespace) -> None:
+    data_dir = Path(args.data_dir).expanduser()
+    if not data_dir.is_dir():
+        die(f"no such directory: {data_dir}")
+    if not any(data_dir.glob("session-*.zip")):
+        print(f"no session-*.zip archives found in {data_dir}")
+        return
+    unpack_sessions(data_dir, force=args.force)
 
 
 # --------------------------------------------------------------------------- #
@@ -835,8 +1962,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_end = sub.add_parser("end", help="export the session, copy artifacts and label them")
     p_end.add_argument("--session", help="opencode session id (default: most recent for this project)")
+    p_end.add_argument("--grantor", default=DEFAULT_GRANTOR, help=f'name credited in licenses/AI-TRAINING-RELEASE.md (default: "{DEFAULT_GRANTOR}")')
     p_end.add_argument("--no-sanitize", dest="sanitize", action="store_false", help="keep secrets/PII in the captured data (not recommended)")
     p_end.set_defaults(func=cmd_end, sanitize=True)
+
+    p_rate = sub.add_parser("rate", help="add a second (or later) rater's labels to a captured session")
+    p_rate.add_argument("session_dir", nargs="?", help="a data/session-* folder (omit with --all)")
+    p_rate.add_argument("--rater", default="rater2", help="rater name, e.g. alice or me-week2 (default: rater2)")
+    p_rate.add_argument("--all", action="store_true", help="rate every captured session under data/")
+    p_rate.add_argument("--force", action="store_true", help="overwrite an existing rating for this rater")
+    p_rate.add_argument("--no-transcript", action="store_true", help="do not print the session transcript before labeling")
+    p_rate.add_argument("--no-color", action="store_true", help="disable ANSI colors in the printed transcript")
+    p_rate.set_defaults(func=cmd_rate)
+
+    p_agree = sub.add_parser("agreement", help="compute inter-rater agreement (Cohen's kappa) across ratings")
+    p_agree.add_argument("--output", help="report path prefix (default: data/agreement)")
+    p_agree.set_defaults(func=cmd_agreement)
+
+    p_catalog = sub.add_parser("catalog", help="write a rerunnable overview of every captured session")
+    p_catalog.add_argument("--output", help="report path prefix (default: data/CATALOG)")
+    p_catalog.set_defaults(func=cmd_catalog)
+
+    p_pack = sub.add_parser("pack", help="archive each data/session-* folder into session-*.zip")
+    p_pack.add_argument("-d", "--dir", dest="data_dir", default="data", help="directory holding session-* folders (default: data)")
+    p_pack.add_argument("-f", "--force", action="store_true", help="overwrite existing archives")
+    p_pack.add_argument("-k", "--keep", action="store_true", help="keep the session folder after packing")
+    p_pack.set_defaults(func=cmd_pack)
+
+    p_unpack = sub.add_parser("unpack", help="extract each data/session-*.zip back to a folder (then delete the archive)")
+    p_unpack.add_argument("-d", "--dir", dest="data_dir", default="data", help="directory holding session-*.zip archives (default: data)")
+    p_unpack.add_argument("-f", "--force", action="store_true", help="overwrite existing session-* folders")
+    p_unpack.set_defaults(func=cmd_unpack)
 
     return parser
 

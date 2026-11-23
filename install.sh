@@ -168,3 +168,8 @@ echo
 echo "Restart opencode so it loads the plugin, then in any repo:"
 echo "  aidata start     # zip the repo per .ai_data_config"
 echo "  aidata end       # export, sanitize, collect licenses, label"
+echo "  aidata rate      # add a second rater's labels to a session"
+echo "  aidata agreement # inter-rater agreement (Cohen's kappa)"
+echo "  aidata catalog   # rewrite the whole-dataset overview (rerunnable)"
+echo "  aidata pack      # archive data/session-* folders into session-*.zip"
+echo "  aidata unpack    # extract session-*.zip archives (then delete them)"
