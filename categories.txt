@@ -1,8 +1,8 @@
-# Session categories for the aidata rubric.
+# Session categories for aidata.
 #
 # One category per line. Blank lines and lines starting with '#' are ignored.
-# Add, remove, or reorder freely -- the rubric shows these in this order and
-# offers an "other (describe)" escape hatch for anything not listed.
+# Add, remove, or reorder freely -- the labeling step shows these in this order
+# and offers an "other (describe)" escape hatch for anything not listed.
 #
 # Keep them mutually exclusive enough that a session clearly falls into one.
 

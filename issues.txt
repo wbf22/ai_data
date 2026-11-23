@@ -1,0 +1,19 @@
+# Session issue tags for aidata.
+#
+# One issue per line. Blank lines and lines starting with '#' are ignored.
+# Add, remove, or reorder freely -- the labeling step shows these in this order
+# and offers an "other (describe)" escape hatch for anything not listed.
+#
+# Tag every issue that applies to a session (a session can have several, or none).
+
+broken code (does not run or is otherwise broken)
+scope deviation (skipped part of, or went beyond, the prompt)
+wrong reasoning / abandoned a correct approach
+tool misuse (bad command, wrong file, ignored tool output)
+context loss (forgot an earlier requirement or decision)
+hallucinated API, symbol, or file
+broke something that worked before
+gave up / stopped early
+bad code or code style that works
+dishonest final message
+incorrect facts or statements

@@ -4,7 +4,7 @@
 Usage:
     python3 aidata.py start            # zip the repo per .ai_data_config -> src.zip
     python3 aidata.py end [--session ID] [--no-sanitize]
-                                       # export the session, copy src.zip, label it, save rubric
+                                       # export the session, copy src.zip, label it, save labels
     python3 aidata.py rate <session-dir> --rater NAME [--all] [--force]
                                        # add a second/later rater's labels to a session
     python3 aidata.py agreement [--output PREFIX]
@@ -17,7 +17,7 @@ and writes src.zip. The "end" step uses `opencode export` (CLI, no TUI needed)
 to grab the current project's most recent session, copies it and src.zip into
 data/<session>/, sanitizes secrets/PII out of every captured artifact, collects
 the repo's license files into data/<session>/licenses/, then runs an interactive
-labeling rubric.
+labeling step.
 
 Sanitization is on by default and reports what it redacted (sanitize-report.*).
 Pass --no-sanitize to keep the raw data.
@@ -45,37 +45,22 @@ REPO_ROOT = Path(__file__).resolve().parent
 DATA_ROOT = REPO_ROOT / "data"
 CONFIG_NAME = ".ai_data_config"
 ZIP_NAME = "src.zip"
+LABELS_JSON = "labels.json"
+LABELS_MD = "labels.md"
+LABELS_VERSION = 5
+LEGACY_LABELS_JSON = "rubric.json"  # captures labeled before the rubric->labels rename
 # where the .opencode/plugin/aidata-capture.ts plugin drops system prompt + tool defs
 CAPTURE_DIR = Path(os.environ.get("AIDATA_CAPTURE_DIR", Path.home() / ".local" / "share" / "opencode" / "aidata-capture"))
-# session categories live with the tool so the taxonomy is shared across every repo
+# session categories and issue tags live with the tool, so the taxonomy is shared
+# across every repo. Both are plain text, one label per line, edited by hand.
 CATEGORIES_FILE = REPO_ROOT / "categories.txt"
+ISSUES_FILE = REPO_ROOT / "issues.txt"
 
 OUTCOME_CHOICES = [
     ("success", "succeeded - task fully accomplished"),
     ("partial", "partial - some of the task done, some not"),
     ("fail", "failed - task not accomplished"),
 ]
-
-ISSUE_ITEMS = [
-    ("broken_code", "broken code (does not run or is otherwise broken)"),
-    ("scope_deviation", "scope deviation (skipped part of, or went beyond, the prompt)"),
-    ("wrong_reasoning", "wrong reasoning / abandoned a correct approach"),
-    ("tool_misuse", "tool misuse (bad command, wrong file, ignored tool output)"),
-    ("context_loss", "context loss (forgot an earlier requirement or decision)"),
-    ("hallucinated_api", "hallucinated API, symbol, or file"),
-    ("broke_existing", "broke something that worked before"),
-    ("gave_up", "gave up / stopped early"),
-    ("bad_code_style", "bad code or code style that works"),
-    ("dishonest_final", "dishonest final message"),
-    ("other", "other"),
-]
-
-EXCEPTIONAL_ITEMS = [
-    ("clever_solution", "clever solution"),
-    ("exceptionally_well_integrated", "exceptionally well integrated in existing code"),
-    ("other", "other"),
-]
-
 
 # --------------------------------------------------------------------------- #
 # helpers
@@ -1027,41 +1012,60 @@ def slugify(text: str) -> str:
     return slug or "uncategorized"
 
 
-def load_categories() -> list[str]:
-    """Read categories.txt (one label per line); fall back to a minimal default."""
-    categories: list[str] = []
-    if CATEGORIES_FILE.is_file():
-        for raw in CATEGORIES_FILE.read_text(encoding="utf-8").splitlines():
+def _load_label_lines(path: Path, fallback: list[str]) -> list[str]:
+    """Read one-label-per-line text; ignore blanks and '#' comments."""
+    labels: list[str] = []
+    if path.is_file():
+        for raw in path.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if line and not line.startswith("#"):
-                categories.append(line)
-    return categories or ["Coding", "Non-coding"]
+                labels.append(line)
+    return labels or fallback
+
+
+def _append_label(path: Path, label: str, header: str, existing: list[str]) -> bool:
+    """Append a label if it isn't already there (case-insensitive). Never raises.
+
+    An unwritable install dir (read-only, permissions) just means the label isn't
+    remembered.
+    """
+    label = " ".join(label.split())
+    if not label or any(c.lower() == label.lower() for c in existing):
+        return False
+    try:
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+            prefix = "" if (not text or text.endswith("\n")) else "\n"
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(f"{prefix}{label}\n")
+        else:
+            path.write_text(header + label + "\n", encoding="utf-8")
+        return True
+    except OSError as exc:  # noqa: BLE001
+        warn(f"could not update {path.name}: {exc}")
+        return False
+
+
+def load_categories() -> list[str]:
+    """Read categories.txt (one label per line); fall back to a minimal default."""
+    return _load_label_lines(CATEGORIES_FILE, ["Coding", "Non-coding"])
 
 
 def add_category(label: str) -> bool:
-    """Append a new category to categories.txt. Returns True if it was added.
+    return _append_label(
+        CATEGORIES_FILE, label, "# Session categories for aidata. One per line.\n", load_categories()
+    )
 
-    De-duplicates case-insensitively and never raises: an unwritable install
-    dir (read-only, permissions) just means the category isn't remembered.
-    """
-    label = " ".join(label.split())
-    if not label or any(c.lower() == label.lower() for c in load_categories()):
-        return False
-    try:
-        if CATEGORIES_FILE.is_file():
-            text = CATEGORIES_FILE.read_text(encoding="utf-8")
-            prefix = "" if (not text or text.endswith("\n")) else "\n"
-            with CATEGORIES_FILE.open("a", encoding="utf-8") as fh:
-                fh.write(f"{prefix}{label}\n")
-        else:
-            CATEGORIES_FILE.write_text(
-                "# Session categories for the aidata rubric. One per line.\n" + label + "\n",
-                encoding="utf-8",
-            )
-        return True
-    except OSError as exc:  # noqa: BLE001
-        warn(f"could not update {CATEGORIES_FILE.name}: {exc}")
-        return False
+
+def load_issues() -> list[str]:
+    """Read issues.txt (one tag per line). Empty is fine; issues are optional."""
+    return _load_label_lines(ISSUES_FILE, [])
+
+
+def add_issue(label: str) -> bool:
+    return _append_label(
+        ISSUES_FILE, label, "# Session issue tags for aidata. One per line.\n", load_issues()
+    )
 
 
 def collect_category() -> dict:
@@ -1075,6 +1079,26 @@ def collect_category() -> dict:
             print(f"  added '{custom}' to {CATEGORIES_FILE.name} (now offered in future sessions)")
         return {"value": slugify(custom), "label": custom, "custom": True}
     return {"value": key, "label": label, "custom": False}
+
+
+def collect_issues() -> list[dict]:
+    """Tag every issue that applies. Tags come from issues.txt (like categories)."""
+    print("\n== Issues ==")
+    print("  select every option that applies (blank = none)")
+    issues = load_issues()
+    items = [(slugify(t), t) for t in issues] + [("__other__", "other (describe)")]
+    selected = ask_multiselect(items)
+    labels_by_key = dict(items)
+    tags: list[dict] = []
+    for key in selected:
+        if key == "__other__":
+            custom = ask_text("  describe the issue")
+            if add_issue(custom):
+                print(f"  added '{custom}' to {ISSUES_FILE.name} (now offered in future sessions)")
+            tags.append({"value": slugify(custom), "label": custom, "custom": True})
+        else:
+            tags.append({"value": key, "label": labels_by_key[key], "custom": False})
+    return tags
 
 
 def collect_difficulty() -> dict:
@@ -1094,48 +1118,26 @@ def collect_outcome() -> dict:
     return {"value": key, "label": label, "evidence": evidence}
 
 
-def collect_items(title: str, items: list[tuple[str, str]]) -> dict:
-    print(f"\n== {title} ==")
-    print("  select every option that applies (blank = none)")
-    selected = ask_multiselect(items)
-    descriptions: dict[str, str] = {}
-    for key, label in items:
-        if key in selected:
-            descriptions[key] = ask_text(f"  describe: {label}")
-    section: dict = {"flagged": bool(selected), "items": {}}
-    for key, label in items:
-        if key in selected:
-            section["items"][key] = {"label": label, "marked": "yes", "description": descriptions[key]}
-        else:
-            section["items"][key] = {"label": label, "marked": "no", "description": None}
-    return section
+def issue_values(section) -> set[str]:
+    """Issue tag values from either the new list form or a legacy structured dict."""
+    if isinstance(section, list):
+        return {t.get("value") for t in section if t.get("value")}
+    return {k for k, v in (section or {}).get("items", {}).items() if v.get("marked") == "yes"}
 
 
-def render_items_section(lines: list[str], heading: str, section: dict) -> None:
-    lines.append(f"## {heading} - {'YES' if section['flagged'] else 'NO'}")
-    lines.append("")
-    for item in section["items"].values():
-        mark = item["marked"].upper()
-        entry = f"- [{mark}] {item['label']}"
-        if item.get("description"):
-            entry += f" - {item['description']}"
-        lines.append(entry)
-    lines.append("")
-
-
-def render_rubric_markdown(rubric: dict) -> str:
-    labels = rubric["labels"]
-    lines = [f"# Rubric - {rubric['session']['id']}", ""]
-    lines.append(f"- **Directory:** {rubric['session'].get('directory', '')}")
-    lines.append(f"- **Model:** {rubric['session'].get('model', '')}")
-    lines.append(f"- **Labeled at:** {rubric.get('labeled_at', '')}")
+def render_labels_markdown(labels_doc: dict) -> str:
+    labels = labels_doc["labels"]
+    lines = [f"# Labels - {labels_doc['session']['id']}", ""]
+    lines.append(f"- **Directory:** {labels_doc['session'].get('directory', '')}")
+    lines.append(f"- **Model:** {labels_doc['session'].get('model', '')}")
+    lines.append(f"- **Labeled at:** {labels_doc.get('labeled_at', '')}")
     category = labels.get("category")
     if category:
         lines.append(f"- **Category:** {category.get('label', category.get('value', ''))}")
     difficulty = labels.get("difficulty")
     if difficulty:
         lines.append(f"- **Difficulty:** {difficulty.get('value')}/10")
-    stats = rubric.get("source_stats")
+    stats = labels_doc.get("source_stats")
     if stats:
         langs = ", ".join(list(stats.get("languages", {}))[:5])
         lines.append(f"- **Source:** {stats.get('files', 0)} files, {stats.get('bytes', 0):,} bytes, {stats.get('lines', 0):,} lines")
@@ -1151,8 +1153,18 @@ def render_rubric_markdown(rubric: dict) -> str:
         lines.append(f"- **Evidence:** {evidence}")
     lines.append("")
 
-    render_items_section(lines, "Issues", labels["issues"])
-    render_items_section(lines, "Anything done exceptionally well?", labels["exceptional"])
+    issues = labels.get("issues") or []
+    if isinstance(issues, list):
+        tags = [t.get("label", t.get("value", "")) for t in issues]
+    else:  # legacy structured dict
+        tags = [v.get("label", k) for k, v in issues.get("items", {}).items() if v.get("marked") == "yes"]
+    lines.append("## Issues")
+    lines.append("")
+    if tags:
+        lines.extend(f"- {t}" for t in tags)
+    else:
+        lines.append("_none_")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -1396,8 +1408,7 @@ def cmd_end(args: argparse.Namespace) -> None:
         "category": collect_category(),
         "difficulty": collect_difficulty(),
         "outcome": collect_outcome(),
-        "issues": collect_items("Issues", ISSUE_ITEMS),
-        "exceptional": collect_items("Exceptional", EXCEPTIONAL_ITEMS),
+        "issues": collect_issues(),
     }
 
     source_stats = None
@@ -1407,8 +1418,8 @@ def cmd_end(args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             warn(f"could not compute source stats: {exc}")
 
-    rubric = {
-        "rubric_version": 4,
+    labels_doc = {
+        "labels_version": LABELS_VERSION,
         "session": {
             "id": info.get("id", session_id),
             "title": info.get("title", ""),
@@ -1438,9 +1449,9 @@ def cmd_end(args: argparse.Namespace) -> None:
         "labeled_at": now_iso(),
     }
 
-    (outdir / "rubric.json").write_text(json.dumps(rubric, indent=2, ensure_ascii=False), encoding="utf-8")
-    (outdir / "rubric.md").write_text(render_rubric_markdown(rubric), encoding="utf-8")
-    print(f"\nsaved rubric.json and rubric.md to {outdir}")
+    (outdir / LABELS_JSON).write_text(json.dumps(labels_doc, indent=2, ensure_ascii=False), encoding="utf-8")
+    (outdir / LABELS_MD).write_text(render_labels_markdown(labels_doc), encoding="utf-8")
+    print(f"\nsaved {LABELS_JSON} and {LABELS_MD} to {outdir}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1450,41 +1461,45 @@ RATINGS_DIR = "ratings"
 PRIMARY_RATER = "rater1"
 
 
+def labels_path(sdir: Path) -> Path:
+    """The labels file for a session folder, tolerating pre-rename captures."""
+    new = sdir / LABELS_JSON
+    return new if new.is_file() else sdir / LEGACY_LABELS_JSON
+
+
 def session_dirs() -> list[Path]:
     if not DATA_ROOT.is_dir():
         return []
-    return sorted(p for p in DATA_ROOT.iterdir() if p.is_dir() and (p / "rubric.json").is_file())
-
-
-def flagged_keys(section: dict) -> set[str]:
-    return {k for k, v in section.get("items", {}).items() if v.get("marked") == "yes"}
+    return sorted(
+        p for p in DATA_ROOT.iterdir()
+        if p.is_dir() and ((p / LABELS_JSON).is_file() or (p / LEGACY_LABELS_JSON).is_file())
+    )
 
 
 def rating_view(labels: dict) -> dict:
-    """Reduce a label set to what agreement needs: values + flagged keys.
+    """Reduce a label set to what agreement needs: category, outcome, issue tags.
 
-    `category` is optional so rubric files written before the category field
-    existed still load.
+    `category` and `issues` are read leniently so captures from older versions
+    still load.
     """
     return {
         "category": (labels.get("category") or {}).get("value"),
         "outcome": labels["outcome"]["value"],
-        "issues": flagged_keys(labels["issues"]),
-        "exceptional": flagged_keys(labels["exceptional"]),
+        "issues": issue_values(labels.get("issues")),
     }
 
 
 def load_session_ratings(sdir: Path) -> dict[str, dict]:
     """Return {rater_name: rating_view} for a session folder.
 
-    The original `rubric.json` is the primary rating; extra raters live in
+    The main labels file is the primary rating; extra raters live in
     `<session>/ratings/<name>.json` so one session can accumulate several.
     """
     ratings: dict[str, dict] = {}
-    rubric_path = sdir / "rubric.json"
-    if rubric_path.is_file():
-        rubric = json.loads(rubric_path.read_text(encoding="utf-8"))
-        ratings[rubric.get("rater") or PRIMARY_RATER] = rating_view(rubric["labels"])
+    main_path = labels_path(sdir)
+    if main_path.is_file():
+        doc = json.loads(main_path.read_text(encoding="utf-8"))
+        ratings[doc.get("rater") or PRIMARY_RATER] = rating_view(doc["labels"])
     rdir = sdir / RATINGS_DIR
     if rdir.is_dir():
         for path in sorted(rdir.glob("*.json")):
@@ -1609,18 +1624,18 @@ def cmd_rate(args: argparse.Namespace) -> None:
         die("pass a session folder or --all")
 
     for sdir in targets:
-        rubric_path = sdir / "rubric.json"
-        if not rubric_path.is_file():
-            warn(f"skip {sdir}: no rubric.json")
+        main_path = labels_path(sdir)
+        if not main_path.is_file():
+            warn(f"skip {sdir}: no labels file")
             continue
-        rubric = json.loads(rubric_path.read_text(encoding="utf-8"))
+        labels_doc = json.loads(main_path.read_text(encoding="utf-8"))
         out = sdir / RATINGS_DIR / f"{args.rater}.json"
         if out.exists() and not args.force:
             warn(f"skip {sdir}: {out.name} already exists (use --force to overwrite)")
             continue
 
-        session = rubric.get("session", {})
-        transcript = (rubric.get("artifacts") or {}).get("session_md")
+        session = labels_doc.get("session", {})
+        transcript = (labels_doc.get("artifacts") or {}).get("session_md")
         print(f"\n=== Rater '{args.rater}' on {sdir.name} ===")
         print(f"  session : {session.get('title', '')}")
         print(f"  model   : {session.get('model', '')}")
@@ -1635,20 +1650,19 @@ def cmd_rate(args: argparse.Namespace) -> None:
                 warn(f"transcript {tpath} not found")
         elif transcript:
             print(f"  review  : {sdir / transcript} (not printed; --no-transcript)")
-        print("\nRead the transcript above, then answer the rubric (labels are hidden to avoid bias).")
+        print("\nRead the transcript above, then label it (the primary labels are hidden to avoid bias).")
 
         labels = {
             "category": collect_category(),
             "difficulty": collect_difficulty(),
             "outcome": collect_outcome(),
-            "issues": collect_items("Issues", ISSUE_ITEMS),
-            "exceptional": collect_items("Exceptional", EXCEPTIONAL_ITEMS),
+            "issues": collect_issues(),
         }
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
             json.dumps(
                 {
-                    "rubric_version": rubric.get("rubric_version", 3),
+                    "labels_version": LABELS_VERSION,
                     "rater": args.rater,
                     "session": session,
                     "labels": labels,
@@ -1715,29 +1729,34 @@ def pair_agreement(sessions: list[dict], r1: str, r2: str) -> dict:
         "kappa": cohen_kappa([x for x, _ in cats], [y for _, y in cats]) if cats else None,
     }
 
-    result: dict = {"n": len(paired), "outcome": outcome, "category": category, "items": {}}
-    for dim, items in (("issues", ISSUE_ITEMS), ("exceptional", EXCEPTIONAL_ITEMS)):
-        a_bits: list[int] = []
-        b_bits: list[int] = []
-        per_item: dict[str, dict] = {}
-        for key, _ in items:
-            ia = [1 if key in s[r1][dim] else 0 for s in paired]
-            ib = [1 if key in s[r2][dim] else 0 for s in paired]
-            a_bits.extend(ia)
-            b_bits.extend(ib)
-            per_item[key] = {
-                "agree": sum(x == y for x, y in zip(ia, ib)),
-                "n": len(paired),
-                "kappa": cohen_kappa(ia, ib),
-            }
-        # aggregate kappa is undefined when neither rater ever raised a flag
-        result["items"][dim] = {
-            "n": len(a_bits),
-            "agree": sum(x == y for x, y in zip(a_bits, b_bits)),
-            "kappa": cohen_kappa(a_bits, b_bits) if (any(a_bits) or any(b_bits)) else None,
-            "per_item": per_item,
+    # Issues are open tags, so compare over the union of every tag either rater
+    # used. Pooled binary kappa mirrors the old flag-based measure; the mean
+    # Jaccard is a natural set-overlap companion.
+    a_issues = [s[r1]["issues"] for s in paired]
+    b_issues = [s[r2]["issues"] for s in paired]
+    vocab = sorted({tag for st in a_issues + b_issues for tag in st})
+    a_bits: list[int] = []
+    b_bits: list[int] = []
+    per_item: dict[str, dict] = {}
+    for tag in vocab:
+        ia = [1 if tag in st else 0 for st in a_issues]
+        ib = [1 if tag in st else 0 for st in b_issues]
+        a_bits.extend(ia)
+        b_bits.extend(ib)
+        per_item[tag] = {
+            "agree": sum(x == y for x, y in zip(ia, ib)),
+            "n": len(paired),
+            "kappa": cohen_kappa(ia, ib),
         }
-    return result
+    overlaps = [len(x & y) / len(x | y) for x, y in zip(a_issues, b_issues) if (x | y)]
+    issues = {
+        "n": len(a_bits),
+        "agree": sum(x == y for x, y in zip(a_bits, b_bits)),
+        "kappa": cohen_kappa(a_bits, b_bits) if (any(a_bits) or any(b_bits)) else None,
+        "jaccard": (sum(overlaps) / len(overlaps)) if overlaps else None,
+        "per_item": per_item,
+    }
+    return {"n": len(paired), "outcome": outcome, "category": category, "issues": issues}
 
 
 def fmt_pct(hit: int, total: int) -> str:
@@ -1783,14 +1802,16 @@ def render_agreement_markdown(report: dict) -> str:
         lines.append(f"- agreement: {fmt_pct(o['agree'], o['n'])} ({o['agree']}/{o['n']})")
         lines.append(f"- Cohen's kappa: {fmt_kappa(o['kappa'])}")
         lines.append("")
-        for dim, title in (("issues", "Issue flags"), ("exceptional", "Exceptional flags")):
-            it = res["items"][dim]
-            lines.append(f"### {title} (binary, all item decisions pooled)")
-            lines.append("")
-            lines.append(f"- agreement: {fmt_pct(it['agree'], it['n'])} ({it['agree']}/{it['n']})")
-            lines.append(f"- Cohen's kappa: {fmt_kappa(it['kappa'])}")
-            lines.append("")
-            lines.append("| item | agreement | kappa |")
+        it = res["issues"]
+        lines.append("### Issue tags (pooled over all tags either rater used)")
+        lines.append("")
+        lines.append(f"- agreement: {fmt_pct(it['agree'], it['n'])} ({it['agree']}/{it['n']})")
+        lines.append(f"- Cohen's kappa: {fmt_kappa(it['kappa'])}")
+        if it.get("jaccard") is not None:
+            lines.append(f"- mean Jaccard: {it['jaccard']:.3f}")
+        lines.append("")
+        if it["per_item"]:
+            lines.append("| tag | agreement | kappa |")
             lines.append("| --- | ---: | ---: |")
             for key, stat in it["per_item"].items():
                 lines.append(f"| {key} | {fmt_pct(stat['agree'], stat['n'])} | {fmt_kappa(stat['kappa'])} |")
@@ -1841,10 +1862,10 @@ def cmd_agreement(args: argparse.Namespace) -> None:
 def catalog_rows() -> list[dict]:
     rows: list[dict] = []
     for sdir in session_dirs():
-        rubric = json.loads((sdir / "rubric.json").read_text(encoding="utf-8"))
-        labels = rubric.get("labels", {})
-        session = rubric.get("session", {})
-        stats = rubric.get("source_stats") or {}
+        labels_doc = json.loads(labels_path(sdir).read_text(encoding="utf-8"))
+        labels = labels_doc.get("labels", {})
+        session = labels_doc.get("session", {})
+        stats = labels_doc.get("source_stats") or {}
         rdir = sdir / RATINGS_DIR
         ratings = sorted(p.stem for p in rdir.glob("*.json")) if rdir.is_dir() else []
         rows.append(
@@ -1860,7 +1881,7 @@ def catalog_rows() -> list[dict]:
                 "bytes": stats.get("bytes"),
                 "lines": stats.get("lines"),
                 "languages": list(stats.get("languages", {}).keys()),
-                "issues": len(flagged_keys(labels.get("issues", {}))),
+                "issues": sorted(issue_values(labels.get("issues"))),
                 "raters": 1 + len(ratings),
             }
         )
@@ -1880,9 +1901,14 @@ def render_catalog_markdown(rows: list[dict]) -> str:
         counts = Counter(r[key] for r in rows if r.get(key))
         return ", ".join(f"{k}: {v}" for k, v in counts.most_common()) or "n/a"
 
+    def tally_all(key: str) -> str:
+        counts = Counter(tag for r in rows for tag in (r.get(key) or []))
+        return ", ".join(f"{k}: {v}" for k, v in counts.most_common()) or "n/a"
+
     lines.append(f"- **By category:** {tally('category')}")
     lines.append(f"- **By outcome:** {tally('outcome')}")
     lines.append(f"- **By model:** {tally('model')}")
+    lines.append(f"- **By issue:** {tally_all('issues')}")
     lines.append(f"- **Total source:** {sum(r['bytes'] or 0 for r in rows):,} bytes, {sum(r['lines'] or 0 for r in rows):,} lines")
     diffs = [r["difficulty"] for r in rows if r.get("difficulty")]
     if diffs:
@@ -1895,7 +1921,7 @@ def render_catalog_markdown(rows: list[dict]) -> str:
         lines.append(
             f"| {r['dir']} | {r['title'][:40]} | {r['category'] or ''} | {diff} | {r['outcome'] or ''} | "
             f"{r['model'] or ''} | {r['files'] if r['files'] is not None else ''} | "
-            f"{r['lines'] if r['lines'] is not None else ''} | {', '.join(r['languages'][:3])} | {r['issues']} | {r['raters']} |"
+            f"{r['lines'] if r['lines'] is not None else ''} | {', '.join(r['languages'][:3])} | {', '.join(r['issues'])} | {r['raters']} |"
         )
     lines.append("")
     return "\n".join(lines) + "\n"
