@@ -9,6 +9,8 @@
 Game development
 Frontend development
 Backend development
+Tools development
+AI/Ml development
 Business planning
 Construction
 Home maintenance
@@ -21,4 +23,5 @@ Cooking
 Religion
 Politics
 Parenting
-AI / ML
+Conversation
+Tech Support

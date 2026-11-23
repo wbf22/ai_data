@@ -92,8 +92,16 @@ def run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
+def warn(msg: str) -> None:
+    print(_tint(f"warning: {msg}", "yellow", stream=sys.stderr), file=sys.stderr)
+
+
+def note(msg: str) -> None:
+    print(_tint(f"note: {msg}", "dim"))
+
+
 def die(msg: str) -> None:
-    print(f"error: {msg}", file=sys.stderr)
+    print(_tint(f"error: {msg}", "red", stream=sys.stderr), file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -114,6 +122,44 @@ def unique_dir(parent: Path, stem: str) -> Path:
 # --------------------------------------------------------------------------- #
 # start: build src.zip from .ai_data_config
 # --------------------------------------------------------------------------- #
+DEFAULT_CONFIG = """\
+# .ai_data_config - what to include in src.zip (gitignore-style globs)
+#
+# `aidata start` zips every file matched here into src.zip; that snapshot is the
+# "before" state the session diff is measured against. Patterns use gitignore
+# syntax, matched against paths relative to the repo root:
+#
+#   - a pattern with no slash matches that name at any depth
+#   - a plain line INCLUDES matching files; a leading '!' EXCLUDES them
+#   - blank lines and lines starting with '#' are ignored
+#
+# Comments must be on their own lines (a trailing comment becomes part of the
+# pattern). This default includes the whole repo; narrow it to keep snapshots
+# small and to leave out secrets or noise.
+
+*
+
+# Exclude things you never want captured in the snapshot:
+!data/
+!.git/
+!node_modules/
+!__pycache__/
+!*.zip
+!*.log
+"""
+
+
+def ensure_config(repo: Path) -> Path:
+    """Return the repo's .ai_data_config, writing a documented default if missing."""
+    config = repo / CONFIG_NAME
+    if not config.exists():
+        config.write_text(DEFAULT_CONFIG, encoding="utf-8")
+        warn(f"no {CONFIG_NAME} found in {repo}")
+        print(f"         wrote a default that includes everything to {config}")
+        print("         edit it to control what goes into src.zip, then re-run if you like.")
+    return config
+
+
 def load_rules(config: Path) -> list[tuple[bool, GitIgnoreSpecPattern]]:
     rules: list[tuple[bool, GitIgnoreSpecPattern]] = []
     for raw in config.read_text(encoding="utf-8").splitlines():
@@ -215,9 +261,9 @@ def repo_stats(zip_path: Path) -> dict:
 
 def cmd_start(args: argparse.Namespace) -> None:
     repo = Path(args.repo).expanduser().resolve()
-    config = repo / CONFIG_NAME
-    if not config.exists():
-        die(f"no {CONFIG_NAME} found in {repo} (create one listing what to include)")
+    if not repo.is_dir():
+        die(f"no such directory: {repo}")
+    config = ensure_config(repo)
 
     rules = load_rules(config)
     zip_path = (repo / args.output).resolve()
@@ -548,9 +594,9 @@ def scan_licenses(license_entries: list[dict], spdx_identifiers: list[dict]) -> 
     return findings
 
 
-def _tint(text: str, style: str) -> str:
+def _tint(text: str, style: str, stream=None) -> str:
     """Wrap `text` in an ANSI style when the terminal supports color."""
-    return f"{ANSI[style]}{text}{ANSI['reset']}" if color_enabled() else text
+    return f"{ANSI[style]}{text}{ANSI['reset']}" if color_enabled(stream=stream) else text
 
 
 def print_license_scan(findings: list[dict]) -> None:
@@ -1014,7 +1060,7 @@ def add_category(label: str) -> bool:
             )
         return True
     except OSError as exc:  # noqa: BLE001
-        print(f"  note: could not update {CATEGORIES_FILE.name}: {exc}", file=sys.stderr)
+        warn(f"could not update {CATEGORIES_FILE.name}: {exc}")
         return False
 
 
@@ -1263,7 +1309,7 @@ def cmd_end(args: argparse.Namespace) -> None:
         shutil.copy2(src_zip, outdir / ZIP_NAME)
         print(f"copied {ZIP_NAME}")
     else:
-        print(f"warning: {ZIP_NAME} not found in {repo}; run `aidata.py start` first")
+        warn(f"{ZIP_NAME} not found in {repo}; run `aidata.py start` first")
 
     tool_outputs = copy_tool_outputs(data, outdir)
     if tool_outputs:
@@ -1273,7 +1319,7 @@ def cmd_end(args: argparse.Namespace) -> None:
     if capture:
         print("copied " + ", ".join(capture.values()))
     else:
-        print("note: no system-prompt/tool-definitions found (is the aidata plugin installed and loaded?)")
+        note("no system-prompt/tool-definitions found (is the aidata plugin installed and loaded?)")
 
     final_state = capture_final_state(repo, outdir, start_zip=outdir / ZIP_NAME if src_copied else None)
     if final_state.get("session_diff"):
@@ -1359,7 +1405,7 @@ def cmd_end(args: argparse.Namespace) -> None:
         try:
             source_stats = repo_stats(outdir / ZIP_NAME)
         except Exception as exc:  # noqa: BLE001
-            print(f"warning: could not compute source stats: {exc}", file=sys.stderr)
+            warn(f"could not compute source stats: {exc}")
 
     rubric = {
         "rubric_version": 4,
@@ -1456,6 +1502,7 @@ ANSI = {
     "dim": "\033[2m",
     "italic": "\033[3m",
     "underline": "\033[4m",
+    "red": "\033[31m",
     "green": "\033[32m",
     "yellow": "\033[33m",
     "blue": "\033[34m",
@@ -1475,11 +1522,11 @@ QUOTE_RE = re.compile(r"^(\s*>+\s?)(.*)$")
 RULE_RE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
 
 
-def color_enabled(force_off: bool = False) -> bool:
+def color_enabled(force_off: bool = False, stream=None) -> bool:
     """Color only on a TTY, and respect the NO_COLOR convention."""
     if force_off or os.environ.get("NO_COLOR"):
         return False
-    return sys.stdout.isatty()
+    return (stream if stream is not None else sys.stdout).isatty()
 
 
 def _inline(text: str) -> str:
@@ -1564,12 +1611,12 @@ def cmd_rate(args: argparse.Namespace) -> None:
     for sdir in targets:
         rubric_path = sdir / "rubric.json"
         if not rubric_path.is_file():
-            print(f"skip {sdir}: no rubric.json")
+            warn(f"skip {sdir}: no rubric.json")
             continue
         rubric = json.loads(rubric_path.read_text(encoding="utf-8"))
         out = sdir / RATINGS_DIR / f"{args.rater}.json"
         if out.exists() and not args.force:
-            print(f"skip {sdir}: {out.name} already exists (use --force to overwrite)")
+            warn(f"skip {sdir}: {out.name} already exists (use --force to overwrite)")
             continue
 
         session = rubric.get("session", {})
@@ -1585,7 +1632,7 @@ def cmd_rate(args: argparse.Namespace) -> None:
                 print_markdown(tpath.read_text(encoding="utf-8"), color=color_enabled(args.no_color))
                 print("=" * 72)
             else:
-                print(f"  warning: transcript {tpath} not found")
+                warn(f"transcript {tpath} not found")
         elif transcript:
             print(f"  review  : {sdir / transcript} (not printed; --no-transcript)")
         print("\nRead the transcript above, then answer the rubric (labels are hidden to avoid bias).")
@@ -1894,7 +1941,7 @@ def cmd_pack(args: argparse.Namespace) -> None:
         name = session_dir.name
         zip_path = data_dir / f"{name}.zip"
         if zip_path.exists() and not args.force:
-            print(f"skip {name} (archive exists; use --force to overwrite)")
+            warn(f"skip {name} (archive exists; use --force to overwrite)")
             continue
         print(f"packing {name} ...")
         zip_path.unlink(missing_ok=True)
@@ -1925,7 +1972,7 @@ def unpack_sessions(data_dir: Path, force: bool = False) -> int:
         name = zip_path.stem
         target = data_dir / name
         if target.exists() and not force:
-            print(f"skip {name} (directory exists; use --force to overwrite)")
+            warn(f"skip {name} (directory exists; use --force to overwrite)")
             continue
         print(f"unpacking {name} ...")
         if target.exists():
@@ -2002,7 +2049,7 @@ def main() -> None:
     try:
         args.func(args)
     except KeyboardInterrupt:
-        print("\naborted", file=sys.stderr)
+        print(_tint("\naborted", "red"), file=sys.stderr)
         raise SystemExit(130)
 
 
