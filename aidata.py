@@ -108,23 +108,41 @@ def unique_dir(parent: Path, stem: str) -> Path:
 # start: build src.zip from .ai_data_config
 # --------------------------------------------------------------------------- #
 DEFAULT_CONFIG = """\
-# .ai_data_config - what to include in src.zip (gitignore-style globs)
+# .ai_data_config - which files go into src.zip (gitignore-style globs)
 #
-# `aidata start` zips every file matched here into src.zip; that snapshot is the
-# "before" state the session diff is measured against. Patterns use gitignore
-# syntax, matched against paths relative to the repo root:
+# `aidata start` zips every file matched here. This snapshot is the "before"
+# state that the session diff is measured against.
 #
-#   - a pattern with no slash matches that name at any depth
-#   - a plain line INCLUDES matching files; a leading '!' EXCLUDES them
-#   - blank lines and lines starting with '#' are ignored
+# One pattern per line:
+#   plain line   -> INCLUDE matching files
+#   '!' prefix   -> EXCLUDE matching files
+#   '#' prefix   -> comment (must be on its own line, or it becomes a pattern)
+#   blank line   -> ignored
 #
-# Comments must be on their own lines (a trailing comment becomes part of the
-# pattern). This default includes the whole repo; narrow it to keep snapshots
-# small and to leave out secrets or noise.
+# A pattern without a slash matches that name at any depth.
+#
+# --- include a file or folder ---
+#   src/                  the src/ folder
+#   main.py               any file named main.py
+#   docs/*.md             markdown files directly inside docs/
+#
+# --- exclude a file or folder ---
+#   !secrets/             the secrets/ folder
+#   !config.local.json    that one file
+#   !build/               any folder named build, at any depth
+#   !src/generated/       that exact folder
+#
+# --- include/exclude by name or extension ---
+#   *.py                  every .py file, at any depth
+#   !*.log                every .log file, at any depth
+#   !test_*.py            files whose names start with test_
+#
+# This default includes the whole repo, then drops the usual noise.
+# Narrow it to keep snapshots small and to leave out secrets.
 
 *
 
-# Exclude things you never want captured in the snapshot:
+# exclusions
 !data/
 !.git/
 !node_modules/
@@ -134,15 +152,15 @@ DEFAULT_CONFIG = """\
 """
 
 
-def ensure_config(repo: Path) -> Path:
-    """Return the repo's .ai_data_config, writing a documented default if missing."""
+def ensure_config(repo: Path) -> tuple[Path, bool]:
+    """Return (config, created), writing a documented default when none exists."""
     config = repo / CONFIG_NAME
     if not config.exists():
         config.write_text(DEFAULT_CONFIG, encoding="utf-8")
         warn(f"no {CONFIG_NAME} found in {repo}")
         print(f"         wrote a default that includes everything to {config}")
-        print("         edit it to control what goes into src.zip, then re-run if you like.")
-    return config
+        return config, True
+    return config, False
 
 
 def load_rules(config: Path) -> list[tuple[bool, GitIgnoreSpecPattern]]:
@@ -191,6 +209,27 @@ def collect_files(
     return sorted(found)
 
 
+def write_zip_with_progress(
+    repo: Path, files: list[str], out_path: Path, label: str = "zipping"
+) -> None:
+    """Write `files` from `repo` into `out_path`, drawing a progress bar on a TTY."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    total = len(files)
+    live = color_enabled()
+    width = 30
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, rel in enumerate(files, 1):
+            zf.write(repo / rel, arcname=rel)
+            if live:
+                done = int(width * i / total) if total else width
+                bar = "#" * done + "-" * (width - done)
+                sys.stdout.write(f"\r  {label} [{bar}] {i}/{total}")
+                sys.stdout.flush()
+    if live:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
 def write_source_zip(
     repo: Path, rules: list[tuple[bool, GitIgnoreSpecPattern]], out_path: Path
 ) -> list[str]:
@@ -201,10 +240,7 @@ def write_source_zip(
     if DATA_ROOT.resolve().is_relative_to(repo):
         exclude_dirs.add(DATA_ROOT.resolve())
     files = collect_files(repo, rules, exclude_files, exclude_dirs)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for rel in files:
-            zf.write(repo / rel, arcname=rel)
+    write_zip_with_progress(repo, files, out_path)
     return files
 
 
@@ -248,7 +284,10 @@ def cmd_start(args: argparse.Namespace) -> None:
     repo = Path(args.repo).expanduser().resolve()
     if not repo.is_dir():
         die(f"no such directory: {repo}")
-    config = ensure_config(repo)
+    config, created = ensure_config(repo)
+    if created:
+        print("         edit it to control what goes into src.zip, then re-run `aidata start`.")
+        raise SystemExit(0)
 
     rules = load_rules(config)
     zip_path = (repo / args.output).resolve()
@@ -262,9 +301,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     if not files:
         die(f"{CONFIG_NAME} matched no files in {repo}")
 
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for rel in files:
-            zf.write(repo / rel, arcname=rel)
+    write_zip_with_progress(repo, files, zip_path)
 
     size = zip_path.stat().st_size
     print(f"wrote {zip_path} ({len(files)} files, {size:,} bytes)")
